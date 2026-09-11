@@ -1,0 +1,220 @@
+name: p396833
+
+on:
+  repository_dispatch:
+    types: [build_396833]
+
+permissions:
+  contents: write
+  actions: read
+
+concurrency:
+  group: p396833-${{ github.event.client_payload.v }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    runs-on: ubuntu-22.04
+    outputs:
+      v: ${{ steps.out.outputs.v }}
+      ref: ${{ steps.out.outputs.ref }}
+      sha: ${{ steps.out.outputs.sha }}
+      rid: ${{ steps.out.outputs.rid }}
+    steps:
+      - id: out
+        shell: bash
+        env:
+          V: ${{ github.event.client_payload.v }}
+          REF: ${{ github.event.client_payload.ref }}
+          SHA: ${{ github.event.client_payload.sha }}
+          RID: ${{ github.event.client_payload.rid }}
+        run: |
+          set -euo pipefail
+          [[ "$V" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || exit 1
+          [[ "$SHA" =~ ^[0-9a-f]{40}$ ]] || exit 1
+          [[ -n "$REF" ]] || exit 1
+          echo "v=$V" >> "$GITHUB_OUTPUT"
+          echo "ref=$REF" >> "$GITHUB_OUTPUT"
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          echo "rid=$RID" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: validate
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: windows-x86_64
+            os: windows-2022
+          - target: linux-x86_64
+            os: ubuntu-22.04
+          # macOS runner 不可用时保持注释
+          # - target: darwin-x64
+          #   os: macos-13
+          # - target: darwin-aarch64
+          #   os: macos-14
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: fetch
+        env:
+          SOURCE_GIT_TOKEN: ${{ secrets.SOURCE_GIT_TOKEN }}
+          SOURCE_GIT_API: ${{ secrets.SOURCE_GIT_API }}
+          SOURCE_GIT_PROJECT: ${{ secrets.SOURCE_GIT_PROJECT_396833 }}
+          SHA: ${{ needs.validate.outputs.sha }}
+        run: |
+          set -euo pipefail
+          mkdir src
+          curl -fsSL -H "PRIVATE-TOKEN: ${SOURCE_GIT_TOKEN}" \
+            "${SOURCE_GIT_API}/projects/${SOURCE_GIT_PROJECT}/repository/archive?sha=${SHA}" \
+            -o src.zip
+          python3 - <<'PY'
+          import zipfile
+          from pathlib import Path
+          dest = Path("src")
+          zpath = Path("src.zip")
+          if zpath.stat().st_size < 10000:
+              raise SystemExit(1)
+          with zipfile.ZipFile(zpath) as z:
+              z.extractall(dest)
+          if not list(dest.rglob("package.json")):
+              raise SystemExit("package.json missing")
+          if not list(dest.rglob("src-tauri/tauri.conf.json")):
+              raise SystemExit("tauri.conf.json missing")
+          PY
+          rm -f src.zip
+
+      - name: setup-node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: setup-rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: linux-deps
+        if: matrix.os == 'ubuntu-22.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libappindicator3-dev \
+            librsvg2-dev \
+            patchelf
+
+      - name: build
+        env:
+          VERSION: ${{ needs.validate.outputs.v }}
+        run: |
+          set -euo pipefail
+          ROOT="$(python3 - <<'PY'
+          from pathlib import Path
+          hits = list(Path("src").rglob("src-tauri/tauri.conf.json"))
+          assert hits, "tauri.conf.json missing"
+          print(hits[0].parents[1])
+          PY
+          )"
+          cd "$ROOT"
+          npm ci
+          npm run download-bun
+          npm run tauri build
+          mkdir -p "${GITHUB_WORKSPACE}/dist"
+          python3 - <<PY
+          from pathlib import Path
+          import shutil
+          root = Path("$ROOT") / "src-tauri" / "target"
+          dest = Path("${GITHUB_WORKSPACE}") / "dist"
+          dest.mkdir(parents=True, exist_ok=True)
+          patterns = ["*.msi", "*.exe", "*.dmg", "*.AppImage", "*.deb"]
+          found = []
+          for pattern in patterns:
+              found.extend(root.rglob(pattern))
+          if not found:
+              raise SystemExit("no tauri artifacts")
+          for path in found:
+              shutil.copy2(path, dest / path.name)
+          PY
+
+      - name: upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: pkg-${{ matrix.target }}
+          path: dist/
+          if-no-files-found: error
+
+  release:
+    needs: [validate, build]
+    runs-on: ubuntu-22.04
+    steps:
+      - name: pull
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          pattern: pkg-*
+
+      - name: pack
+        env:
+          VERSION: ${{ needs.validate.outputs.v }}
+          SOURCE_SHA: ${{ needs.validate.outputs.sha }}
+          SOURCE_REF: ${{ needs.validate.outputs.ref }}
+          REQUEST_ID: ${{ needs.validate.outputs.rid }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          python3 - <<'PY'
+          import hashlib, json, os, pathlib, shutil, time
+          version = os.environ["VERSION"]
+          source_sha = os.environ["SOURCE_SHA"]
+          source_ref = os.environ["SOURCE_REF"]
+          request_id = os.environ["REQUEST_ID"]
+          artifacts = pathlib.Path("artifacts")
+          dist = pathlib.Path("dist")
+          dist.mkdir(exist_ok=True)
+          files = [p for p in artifacts.rglob("*") if p.is_file()]
+          if not files:
+              raise SystemExit("no artifacts")
+          assets = []
+          for path in files:
+              dest = dist / path.name
+              shutil.copy2(path, dest)
+              digest = hashlib.sha256(dest.read_bytes()).hexdigest()
+              assets.append({"name": dest.name, "sha256": digest})
+          manifest = {
+              "name": "omp-desktop",
+              "version": version,
+              "contract_version": "release.v1",
+              "request_id": request_id,
+              "source_provider": "gongfeng",
+              "source_project_key": "omp-desktop",
+              "source_ref": source_ref,
+              "source_commit_sha": source_sha,
+              "built_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+              "assets": assets,
+          }
+          (dist / f"omp-desktop-v{version}-manifest.json").write_text(
+              json.dumps(manifest, indent=2, ensure_ascii=False) + "\n",
+              encoding="utf-8",
+          )
+          PY
+
+      - name: tag
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ needs.validate.outputs.v }}
+          SOURCE_SHA: ${{ needs.validate.outputs.sha }}
+          REQUEST_ID: ${{ needs.validate.outputs.rid }}
+        run: |
+          set -euo pipefail
+          TAG="omp-desktop-v${VERSION}"
+          if gh release view "$TAG" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            exit 1
+          fi
+          NOTES="sha: ${SOURCE_SHA}
+          rid: ${REQUEST_ID}"
+          gh release create "$TAG" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --title "$TAG" \
+            --notes "$NOTES" \
+            dist/*

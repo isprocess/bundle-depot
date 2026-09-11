@@ -1,0 +1,243 @@
+name: p396057
+
+on:
+  repository_dispatch:
+    types: [build_396057]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: p396057-${{ github.event.client_payload.v }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    runs-on: ubuntu-22.04
+    outputs:
+      v: ${{ steps.out.outputs.v }}
+      ref: ${{ steps.out.outputs.ref }}
+      sha: ${{ steps.out.outputs.sha }}
+      rid: ${{ steps.out.outputs.rid }}
+    steps:
+      - id: out
+        shell: bash
+        env:
+          V: ${{ github.event.client_payload.v }}
+          REF: ${{ github.event.client_payload.ref }}
+          SHA: ${{ github.event.client_payload.sha }}
+          RID: ${{ github.event.client_payload.rid }}
+        run: |
+          set -euo pipefail
+          [[ "$V" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || exit 1
+          [[ "$SHA" =~ ^[0-9a-f]{40}$ ]] || exit 1
+          [[ -n "$REF" ]] || exit 1
+          echo "v=$V" >> "$GITHUB_OUTPUT"
+          echo "ref=$REF" >> "$GITHUB_OUTPUT"
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          echo "rid=$RID" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: validate
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: linux-x86_64
+            os: ubuntu-22.04
+            archive: tar.gz
+          - target: windows-x86_64
+            os: windows-2022
+            archive: zip
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: fetch
+        env:
+          SOURCE_GIT_TOKEN: ${{ secrets.SOURCE_GIT_TOKEN }}
+          SOURCE_GIT_API: ${{ secrets.SOURCE_GIT_API }}
+          SOURCE_GIT_PROJECT: ${{ secrets.SOURCE_GIT_PROJECT_396057 }}
+          SHA: ${{ needs.validate.outputs.sha }}
+        run: |
+          set -euo pipefail
+          mkdir src
+          curl -fsSL -H "PRIVATE-TOKEN: ${SOURCE_GIT_TOKEN}" \
+            "${SOURCE_GIT_API}/projects/${SOURCE_GIT_PROJECT}/repository/archive?sha=${SHA}" \
+            -o src.zip
+          python3 - <<'PY'
+          import zipfile
+          from pathlib import Path
+          dest = Path("src")
+          zpath = Path("src.zip")
+          if zpath.stat().st_size < 1000:
+              raise SystemExit(1)
+          with zipfile.ZipFile(zpath) as z:
+              z.extractall(dest)
+          if not list(dest.rglob("Cargo.toml")):
+              raise SystemExit(1)
+          if not list(dest.rglob("scripts/package-release.sh")):
+              raise SystemExit(1)
+          PY
+          rm -f src.zip
+
+      - name: tool
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.88"
+
+      - name: compile
+        env:
+          STORYBOOK_SOURCE_COMMIT: ${{ needs.validate.outputs.sha }}
+        run: |
+          set -euo pipefail
+          ROOT="$(python3 - <<'PY'
+          from pathlib import Path
+          hits = list(Path("src").rglob("Cargo.toml"))
+          assert hits, "Cargo.toml missing"
+          print(hits[0].parent)
+          PY
+          )"
+          cd "$ROOT"
+          cargo build --release --locked --bin txt-to-epub
+
+      - name: pack
+        env:
+          VERSION: ${{ needs.validate.outputs.v }}
+          TARGET: ${{ matrix.target }}
+          ARCHIVE: ${{ matrix.archive }}
+          STORYBOOK_SOURCE_COMMIT: ${{ needs.validate.outputs.sha }}
+        run: |
+          set -euo pipefail
+          ROOT="$(python3 - <<'PY'
+          from pathlib import Path
+          hits = list(Path("src").rglob("Cargo.toml"))
+          assert hits, "Cargo.toml missing"
+          print(hits[0].parent)
+          PY
+          )"
+          PKG_ROOT="${RUNNER_TEMP}/pkg"
+          mkdir -p "$PKG_ROOT"
+          chmod +x "$ROOT/scripts/"* || true
+          if [[ "$TARGET" == windows-* ]]; then
+            BIN="$ROOT/target/release/txt-to-epub.exe"
+          else
+            BIN="$ROOT/target/release/txt-to-epub"
+          fi
+          "$ROOT/scripts/package-release.sh" "$BIN" "$TARGET" "$PKG_ROOT" "$VERSION"
+          "$ROOT/scripts/verify-release-package.sh" "$PKG_ROOT/storybook" "$TARGET"
+          ASSET="storybook-v${VERSION}-${TARGET}.${ARCHIVE}"
+          mkdir -p dist
+          if [[ "$ARCHIVE" == "tar.gz" ]]; then
+            tar -C "$PKG_ROOT" -czf "dist/${ASSET}" storybook
+          else
+            (cd "$PKG_ROOT" && python3 -c 'import shutil,sys; shutil.make_archive(sys.argv[1], "zip", ".", "storybook")' "${GITHUB_WORKSPACE}/dist/storybook-v${VERSION}-${TARGET}")
+          fi
+          cp "$PKG_ROOT/storybook/manifest.json" "dist/manifest-${TARGET}.json"
+
+      - name: upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: pkg-${{ matrix.target }}
+          path: |
+            dist/storybook-v${{ needs.validate.outputs.v }}-${{ matrix.target }}.${{ matrix.archive }}
+            dist/manifest-${{ matrix.target }}.json
+          if-no-files-found: error
+
+  release:
+    needs: [validate, build]
+    runs-on: ubuntu-22.04
+    steps:
+      - name: pull
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: sum
+        env:
+          VERSION: ${{ needs.validate.outputs.v }}
+          SOURCE_REF: ${{ needs.validate.outputs.ref }}
+          SOURCE_SHA: ${{ needs.validate.outputs.sha }}
+          REQUEST_ID: ${{ needs.validate.outputs.rid }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib, json, os, pathlib, time
+          version = os.environ["VERSION"]
+          source_ref = os.environ["SOURCE_REF"]
+          source_sha = os.environ["SOURCE_SHA"]
+          request_id = os.environ["REQUEST_ID"]
+          run_id = os.environ["RUN_ID"]
+          root = pathlib.Path("artifacts")
+          linux_pkg = next(root.rglob(f"storybook-v{version}-linux-x86_64.tar.gz"))
+          win_pkg = next(root.rglob(f"storybook-v{version}-windows-x86_64.zip"))
+
+          def sha256(p):
+              h = hashlib.sha256()
+              with p.open("rb") as f:
+                  for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                      h.update(chunk)
+              return h.hexdigest()
+
+          linux_sha = sha256(linux_pkg)
+          win_sha = sha256(win_pkg)
+          outdir = pathlib.Path("dist")
+          outdir.mkdir(exist_ok=True)
+          linux_name = f"storybook-v{version}-linux-x86_64.tar.gz"
+          win_name = f"storybook-v{version}-windows-x86_64.zip"
+          man_name = f"storybook-v{version}-manifest.json"
+          sums_name = f"storybook-v{version}-checksums.txt"
+          (outdir / linux_name).write_bytes(linux_pkg.read_bytes())
+          (outdir / win_name).write_bytes(win_pkg.read_bytes())
+          manifest = {
+              "name": "storybook",
+              "version": version,
+              "contract_version": "release.v1",
+              "request_id": request_id,
+              "source_provider": "gongfeng",
+              "source_project_key": "storybook",
+              "source_ref": source_ref,
+              "source_commit_sha": source_sha,
+              "workflow_run_id": str(run_id),
+              "built_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+              "targets": ["linux-x86_64", "windows-x86_64"],
+              "assets": [
+                  {"name": linux_name, "sha256": linux_sha, "target": "linux-x86_64"},
+                  {"name": win_name, "sha256": win_sha, "target": "windows-x86_64"},
+              ],
+          }
+          man_path = outdir / man_name
+          man_path.write_text(json.dumps(manifest, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+          man_sha = sha256(man_path)
+          sums = [
+              f"{linux_sha}  {linux_name}",
+              f"{win_sha}  {win_name}",
+              f"{man_sha}  {man_name}",
+          ]
+          (outdir / sums_name).write_text("\n".join(sums) + "\n", encoding="utf-8")
+          PY
+
+      - name: tag
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ needs.validate.outputs.v }}
+          SOURCE_SHA: ${{ needs.validate.outputs.sha }}
+          REQUEST_ID: ${{ needs.validate.outputs.rid }}
+        run: |
+          set -euo pipefail
+          TAG="storybook-v${VERSION}"
+          if gh release view "$TAG" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            exit 1
+          fi
+          NOTES="sha: ${SOURCE_SHA}
+          rid: ${REQUEST_ID}"
+          gh release create "$TAG" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --title "$TAG" \
+            --notes "$NOTES" \
+            "dist/storybook-v${VERSION}-linux-x86_64.tar.gz" \
+            "dist/storybook-v${VERSION}-windows-x86_64.zip" \
+            "dist/storybook-v${VERSION}-checksums.txt" \
+            "dist/storybook-v${VERSION}-manifest.json"

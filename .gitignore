@@ -1,0 +1,7 @@
+docs
+.claude
+.agents
+tmp
+__pycache__/
+*.pyc
+*.pyo

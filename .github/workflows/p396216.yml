@@ -1,0 +1,305 @@
+name: p396216
+
+on:
+  repository_dispatch:
+    types: [build_396216]
+
+permissions:
+  contents: write
+  id-token: write
+  packages: write
+  actions: read
+
+concurrency:
+  group: p396216-${{ github.event.client_payload.v }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    runs-on: ubuntu-22.04
+    outputs:
+      v: ${{ steps.out.outputs.v }}
+      ref: ${{ steps.out.outputs.ref }}
+      sha: ${{ steps.out.outputs.sha }}
+      rid: ${{ steps.out.outputs.rid }}
+    steps:
+      - id: out
+        shell: bash
+        env:
+          V: ${{ github.event.client_payload.v }}
+          REF: ${{ github.event.client_payload.ref }}
+          SHA: ${{ github.event.client_payload.sha }}
+          RID: ${{ github.event.client_payload.rid }}
+        run: |
+          set -euo pipefail
+          [[ "$V" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || exit 1
+          [[ "$SHA" =~ ^[0-9a-f]{40}$ ]] || exit 1
+          [[ -n "$REF" ]] || exit 1
+          echo "v=$V" >> "$GITHUB_OUTPUT"
+          echo "ref=$REF" >> "$GITHUB_OUTPUT"
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          echo "rid=$RID" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: validate
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            platform: linux/amd64
+            os: ubuntu-22.04
+          - arch: arm64
+            platform: linux/arm64
+            os: ubuntu-24.04-arm
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: fetch
+        env:
+          SOURCE_GIT_TOKEN: ${{ secrets.SOURCE_GIT_TOKEN }}
+          SOURCE_GIT_API: ${{ secrets.SOURCE_GIT_API }}
+          SOURCE_GIT_PROJECT: ${{ secrets.SOURCE_GIT_PROJECT_396216 }}
+          SHA: ${{ needs.validate.outputs.sha }}
+        run: |
+          set -euo pipefail
+          mkdir src
+          curl -fsSL -H "PRIVATE-TOKEN: ${SOURCE_GIT_TOKEN}" \
+            "${SOURCE_GIT_API}/projects/${SOURCE_GIT_PROJECT}/repository/archive?sha=${SHA}" \
+            -o src.zip
+          python3 - <<'PY'
+          import zipfile
+          from pathlib import Path
+          dest = Path("src")
+          zpath = Path("src.zip")
+          if zpath.stat().st_size < 1000:
+              raise SystemExit(1)
+          with zipfile.ZipFile(zpath) as z:
+              z.extractall(dest)
+          if not any(p.name == "Dockerfile" for p in dest.rglob("Dockerfile")):
+              raise SystemExit(1)
+          if not list(dest.rglob("go.mod")):
+              raise SystemExit(1)
+          if not list(dest.rglob("web/package.json")):
+              raise SystemExit(1)
+          PY
+          rm -f src.zip
+
+      - name: root
+        run: |
+          set -euo pipefail
+          ROOT="$(python3 - <<'PY'
+          from pathlib import Path
+          hits = []
+          for p in Path("src").rglob("Dockerfile"):
+              if p.name != "Dockerfile":
+                  continue
+              if (p.parent / "go.mod").is_file():
+                  hits.append(p.parent)
+          assert hits, "src root missing"
+          print(hits[0])
+          PY
+          )"
+          echo "SRC_ROOT=${ROOT}" >> "$GITHUB_ENV"
+
+      - name: version
+        env:
+          VERSION: ${{ needs.validate.outputs.v }}
+        run: |
+          set -euo pipefail
+          echo "v${VERSION}" > "${SRC_ROOT}/VERSION"
+
+      - name: chmod
+        run: |
+          set -euo pipefail
+          chmod +x "${SRC_ROOT}/scripts/"* || true
+
+      - name: setup-buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c
+
+      - name: login
+        uses: docker/login-action@c99871dec2022cc055c062a10cc1a1310835ceb4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: meta
+        id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302
+        with:
+          images: isprocess/new-api
+
+      - name: build
+        id: build
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a
+        with:
+          context: ${{ env.SRC_ROOT }}
+          file: ${{ env.SRC_ROOT }}/Dockerfile
+          platforms: ${{ matrix.platform }}
+          push: true
+          tags: |
+            isprocess/new-api:v${{ needs.validate.outputs.v }}-${{ matrix.arch }}
+            isprocess/new-api:latest-${{ matrix.arch }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: mode=max
+          sbom: true
+
+      - name: install-cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6
+
+      - name: sign
+        run: cosign sign --yes isprocess/new-api@${{ steps.build.outputs.digest }}
+
+      - name: digest
+        env:
+          VERSION: ${{ needs.validate.outputs.v }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          echo "${DIGEST}" > "dist/digest-${{ matrix.arch }}.txt"
+          echo "isprocess/new-api:v${VERSION}-${{ matrix.arch }}" > "dist/tag-${{ matrix.arch }}.txt"
+
+      - name: upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: pkg-${{ matrix.arch }}
+          path: dist/
+          if-no-files-found: error
+
+  manifest:
+    needs: [validate, build]
+    runs-on: ubuntu-22.04
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: login
+        uses: docker/login-action@c99871dec2022cc055c062a10cc1a1310835ceb4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: create
+        env:
+          VERSION: ${{ needs.validate.outputs.v }}
+        run: |
+          set -euo pipefail
+          TAG="v${VERSION}"
+          docker buildx imagetools create \
+            -t "isprocess/new-api:${TAG}" \
+            "isprocess/new-api:${TAG}-amd64" \
+            "isprocess/new-api:${TAG}-arm64"
+          docker buildx imagetools create \
+            -t "isprocess/new-api:latest" \
+            "isprocess/new-api:latest-amd64" \
+            "isprocess/new-api:latest-arm64"
+
+      - name: install-cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6
+
+      - name: sign
+        env:
+          VERSION: ${{ needs.validate.outputs.v }}
+        run: |
+          set -euo pipefail
+          TAG="v${VERSION}"
+          cosign sign --yes "isprocess/new-api:${TAG}"
+          cosign sign --yes "isprocess/new-api:latest"
+
+  release:
+    needs: [validate, build, manifest]
+    runs-on: ubuntu-22.04
+    steps:
+      - name: pull
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          pattern: pkg-*
+
+      - name: sum
+        env:
+          VERSION: ${{ needs.validate.outputs.v }}
+          SOURCE_REF: ${{ needs.validate.outputs.ref }}
+          SOURCE_SHA: ${{ needs.validate.outputs.sha }}
+          REQUEST_ID: ${{ needs.validate.outputs.rid }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib, json, os, pathlib, time
+          version = os.environ["VERSION"]
+          source_ref = os.environ["SOURCE_REF"]
+          source_sha = os.environ["SOURCE_SHA"]
+          request_id = os.environ["REQUEST_ID"]
+          run_id = os.environ["RUN_ID"]
+          root = pathlib.Path("artifacts")
+          amd = next(root.rglob("digest-amd64.txt")).read_text(encoding="utf-8").strip()
+          arm = next(root.rglob("digest-arm64.txt")).read_text(encoding="utf-8").strip()
+          if not amd or not arm:
+              raise SystemExit(1)
+
+          def sha256(p):
+              h = hashlib.sha256()
+              with p.open("rb") as f:
+                  for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                      h.update(chunk)
+              return h.hexdigest()
+
+          outdir = pathlib.Path("dist")
+          outdir.mkdir(exist_ok=True)
+          man_name = f"new-api-v{version}-manifest.json"
+          sums_name = f"new-api-v{version}-checksums.txt"
+          manifest = {
+              "name": "new-api",
+              "version": version,
+              "image": "isprocess/new-api",
+              "contract_version": "release.v1",
+              "request_id": request_id,
+              "source_provider": "gongfeng",
+              "source_project_key": "new-api",
+              "source_ref": source_ref,
+              "source_commit_sha": source_sha,
+              "workflow_run_id": str(run_id),
+              "built_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+              "targets": ["linux/amd64", "linux/arm64"],
+              "tags": [
+                  f"v{version}",
+                  "latest",
+                  f"v{version}-amd64",
+                  f"v{version}-arm64",
+                  "latest-amd64",
+                  "latest-arm64",
+              ],
+              "digests": {"amd64": amd, "arm64": arm},
+          }
+          man_path = outdir / man_name
+          man_path.write_text(json.dumps(manifest, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+          man_sha = sha256(man_path)
+          (outdir / sums_name).write_text(f"{man_sha}  {man_name}\n", encoding="utf-8")
+          PY
+
+      - name: tag
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ needs.validate.outputs.v }}
+          SOURCE_SHA: ${{ needs.validate.outputs.sha }}
+          REQUEST_ID: ${{ needs.validate.outputs.rid }}
+        run: |
+          set -euo pipefail
+          TAG="new-api-v${VERSION}"
+          if gh release view "$TAG" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            exit 1
+          fi
+          NOTES="sha: ${SOURCE_SHA}
+          rid: ${REQUEST_ID}"
+          gh release create "$TAG" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --title "$TAG" \
+            --notes "$NOTES" \
+            "dist/new-api-v${VERSION}-manifest.json" \
+            "dist/new-api-v${VERSION}-checksums.txt"

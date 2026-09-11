@@ -1,0 +1,317 @@
+name: p396177
+
+on:
+  repository_dispatch:
+    types: [build_396177]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: p396177-${{ github.event.client_payload.tag }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    runs-on: ubuntu-22.04
+    permissions: {}
+    outputs:
+      tag: ${{ steps.check.outputs.tag }}
+      sha: ${{ steps.check.outputs.sha }}
+      rid: ${{ steps.check.outputs.rid }}
+    steps:
+      - name: check-payload
+        id: check
+        env:
+          PAYLOAD: ${{ toJSON(github.event.client_payload) }}
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY'
+          import json, os, re, sys
+
+          def fail(msg):
+              print(f"error: {msg}", file=sys.stderr)
+              sys.exit(1)
+
+          try:
+              payload = json.loads(os.environ.get("PAYLOAD", "{}"))
+          except Exception as e:
+              fail(f"payload is not valid JSON: {e}")
+
+          if not isinstance(payload, dict) or set(payload.keys()) != {"tag", "sha", "rid"}:
+              fail(f"payload must contain exactly tag, sha and rid: {payload!r}")
+
+          tag = payload["tag"]
+          sha = payload["sha"]
+          rid = payload["rid"]
+
+          if not isinstance(tag, str) or not re.match(r'^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$', tag):
+              fail(f"tag format is not allowed: {tag!r}")
+          if not isinstance(sha, str) or not re.match(r'^[0-9a-f]{40}$', sha):
+              fail(f"sha format is not allowed: {sha!r}")
+          if not isinstance(rid, str) or not re.match(r'^b-[0-9.]+-[0-9a-f]{12}-[0-9]{8}T[0-9]{6}Z$', rid):
+              fail(f"rid format is not allowed: {rid!r}")
+
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write(f"tag={tag}\n")
+              f.write(f"sha={sha}\n")
+              f.write(f"rid={rid}\n")
+
+          print(f"tag={tag} sha={sha} rid={rid}")
+          PY
+
+  build:
+    needs: validate
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: linux-x64
+            os: ubuntu-22.04
+            binary: github-api-linux-x64.bin
+          - target: windows-x64
+            os: windows-2022
+            binary: github-api-windows-x64.exe
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: checkout-scripts
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          sparse-checkout: .github/scripts
+          sparse-checkout-cone-mode: false
+
+      - name: verify-tag
+        env:
+          SOURCE_GIT_TOKEN: ${{ secrets.SOURCE_GIT_TOKEN }}
+          SOURCE_GIT_API: ${{ secrets.SOURCE_GIT_API }}
+          SOURCE_GIT_PROJECT: ${{ secrets.SOURCE_GIT_PROJECT_396177 }}
+          TAG: ${{ needs.validate.outputs.tag }}
+          SHA: ${{ needs.validate.outputs.sha }}
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY'
+          import json, os, sys, urllib.error, urllib.parse, urllib.request
+
+          tag = os.environ["TAG"]
+          expected = os.environ["SHA"]
+          url = (f"{os.environ['SOURCE_GIT_API'].rstrip('/')}/projects/"
+                 f"{os.environ['SOURCE_GIT_PROJECT']}/repository/tags/"
+                 f"{urllib.parse.quote(tag, safe='')}")
+          request = urllib.request.Request(url)
+          request.add_header("PRIVATE-TOKEN", os.environ["SOURCE_GIT_TOKEN"])
+          try:
+              with urllib.request.urlopen(request, timeout=60) as response:
+                  data = json.loads(response.read())
+          except urllib.error.HTTPError as e:
+              print(f"error: tag lookup failed: HTTP {e.code}", file=sys.stderr)
+              sys.exit(1)
+          actual = (data.get("commit") or {}).get("id")
+          if actual != expected:
+              print(f"error: tag SHA mismatch: {actual} != {expected}", file=sys.stderr)
+              sys.exit(1)
+          print(f"tag {tag} points at {actual}")
+          PY
+
+      - name: fetch-source
+        env:
+          SOURCE_GIT_TOKEN: ${{ secrets.SOURCE_GIT_TOKEN }}
+          SOURCE_GIT_API: ${{ secrets.SOURCE_GIT_API }}
+          SOURCE_GIT_PROJECT: ${{ secrets.SOURCE_GIT_PROJECT_396177 }}
+          SHA: ${{ needs.validate.outputs.sha }}
+        run: |
+          set -euo pipefail
+
+          curl -fsSL -H "PRIVATE-TOKEN: ${SOURCE_GIT_TOKEN}" \
+            "${SOURCE_GIT_API}/projects/${SOURCE_GIT_PROJECT}/repository/archive?sha=${SHA}" \
+            -o src.zip
+
+          python3 - <<'PY'
+          import zipfile
+          from pathlib import Path
+
+          archive = Path("src.zip")
+          if archive.stat().st_size < 1000:
+              raise SystemExit("error: archive is too small")
+          with zipfile.ZipFile(archive) as z:
+              names = z.namelist()
+              if not names or any(n.startswith("/") or ".." in Path(n).parts for n in names):
+                  raise SystemExit("error: archive contains unsafe entry names")
+              z.extractall(".")
+          archive.unlink()
+          print("ok: source extracted")
+          PY
+
+      - name: assert-files
+        run: |
+          set -euo pipefail
+
+          python3 .github/scripts/assert-files.py \
+            --root . \
+            --files README.md,AGENTS.md,docs/github-api.md \
+            --globs github-api/Cargo.toml
+
+      - name: build-github-api
+        run: |
+          set -euo pipefail
+
+          cd github-api
+          cargo build --release --locked
+          cd ..
+
+          if [[ "${{ matrix.target }}" == windows-* ]]; then
+            SRC="github-api/target/release/github-api.exe"
+          else
+            SRC="github-api/target/release/github-api"
+          fi
+          test -f "$SRC"
+          mkdir -p dist
+          cp "$SRC" "dist/${{ matrix.binary }}"
+          if [[ "${{ matrix.target }}" == linux-* ]]; then
+            cp docs/github-api.md dist/github-api-usage.md
+          fi
+          ls -l dist
+          echo "ok: ${{ matrix.target }} package prepared"
+
+      - name: upload-pkg
+        uses: actions/upload-artifact@50769540e7f4bd5e21e526ee35c689e35e0d6874
+        with:
+          name: pkg-${{ matrix.target }}
+          path: dist/
+          retention-days: 1
+          if-no-files-found: error
+
+  prepare-bundle:
+    needs: [validate, build]
+    runs-on: ubuntu-22.04
+    steps:
+      - name: checkout-scripts
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          sparse-checkout: .github/scripts
+          sparse-checkout-cone-mode: false
+
+      - name: download-linux
+        uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16
+        with:
+          name: pkg-linux-x64
+          path: release-bundle/assets/
+
+      - name: download-windows
+        uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16
+        with:
+          name: pkg-windows-x64
+          path: release-bundle/assets/
+
+      - name: prepare-bundle
+        env:
+          TAG: ${{ needs.validate.outputs.tag }}
+          SHA: ${{ needs.validate.outputs.sha }}
+          RID: ${{ needs.validate.outputs.rid }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+
+          version="${TAG#v}"
+
+          python3 - <<'PY'
+          import hashlib, json, os, time
+          from pathlib import Path
+
+          def sha256(path):
+              digest = hashlib.sha256()
+              with path.open("rb") as f:
+                  for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                      digest.update(chunk)
+              return digest.hexdigest()
+
+          version = os.environ["TAG"][1:]
+          assets = Path("release-bundle/assets")
+
+          files = []
+          for name, platform in (("github-api-linux-x64.bin", "linux-x64"),
+                                 ("github-api-windows-x64.exe", "windows-x64"),
+                                 ("github-api-usage.md", "any")):
+              path = assets / name
+              if not path.is_file():
+                  raise SystemExit(f"error: missing asset {name}")
+              files.append({
+                  "name": name,
+                  "platform": platform,
+                  "size": path.stat().st_size,
+                  "sha256": sha256(path),
+              })
+
+          manifest = {
+              "contract_version": "release.v2",
+              "kind": "files",
+              "tag": os.environ["TAG"],
+              "version": version,
+              "source_commit_sha": os.environ["SHA"],
+              "request_id": os.environ["RID"],
+              "workflow_run_id": os.environ["RUN_ID"],
+              "built_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+              "files": files,
+          }
+
+          name = f"git-doc-{version}-manifest.json"
+          (assets / name).write_text(
+              json.dumps(manifest, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+          print(f"ok: wrote {name}")
+          PY
+
+          python3 .github/scripts/generate-envelope.py \
+            --schema publish.v1 \
+            --kind files \
+            --tag "$TAG" \
+            --sha "$SHA" \
+            --rid "$RID" \
+            --manifest "git-doc-${version}-manifest.json" \
+            --checksums "git-doc-${version}-checksums.txt" \
+            --output release-bundle/publish.json \
+            --manifest-path "release-bundle/assets/git-doc-${version}-manifest.json"
+
+          cat > release-bundle/release-notes.md <<EOF
+          ## github-api ${version}
+
+          Generic GitHub REST command line tool, shipped for Linux x64 and Windows x64 with its usage document.
+
+          - Linux binary: \`github-api-linux-x64.bin\`
+          - Windows binary: \`github-api-windows-x64.exe\`
+          - Document: \`github-api-usage.md\`
+
+          \`\`\`bash
+          chmod +x github-api-linux-x64.bin
+          ./github-api-linux-x64.bin --help
+          \`\`\`
+
+          On Windows, run \`github-api-windows-x64.exe --help\` from a terminal.
+
+          Source SHA: \`${SHA}\`
+          EOF
+
+          echo "ok: release-bundle prepared"
+
+      - name: upload-bundle
+        uses: actions/upload-artifact@50769540e7f4bd5e21e526ee35c689e35e0d6874
+        with:
+          name: release-bundle
+          path: release-bundle/
+          retention-days: 1
+          if-no-files-found: error
+
+  publish:
+    needs: [validate, prepare-bundle]
+    uses: ./.github/workflows/publish.yml
+    with:
+      tag: ${{ needs.validate.outputs.tag }}
+      sha: ${{ needs.validate.outputs.sha }}
+      rid: ${{ needs.validate.outputs.rid }}
+    secrets:
+      api: ${{ secrets.SOURCE_GIT_API }}
+      project: ${{ secrets.SOURCE_GIT_PROJECT_396177 }}
+      token: ${{ secrets.SOURCE_GIT_TOKEN }}
