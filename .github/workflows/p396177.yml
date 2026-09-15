@@ -274,10 +274,10 @@ jobs:
           ./target/release/bundle-tool assemble \
             --input ../packages \
             --usage-dir ../usage \
-            --output ../release-bundle \
+            --output "$GITHUB_WORKSPACE/release-bundle" \
             --tag "$TAG" --sha "$SHA" --rid "$RID"
 
-          ls -R ../release-bundle
+          ls -R "$GITHUB_WORKSPACE/release-bundle"
 
       - name: upload-bundle
         uses: actions/upload-artifact@50769540e7f4bd5e21e526ee35c689e35e0d6874
