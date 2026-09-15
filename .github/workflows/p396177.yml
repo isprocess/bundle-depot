@@ -113,8 +113,8 @@ jobs:
         run: |
           set -euo pipefail
 
-          curl -fsSL -H "PRIVATE-TOKEN: ${SOURCE_GIT_TOKEN}" \\
-            "${SOURCE_GIT_API}/projects/${SOURCE_GIT_PROJECT}/repository/archive?sha=${SHA}" \\
+          curl -fsSL -H "PRIVATE-TOKEN: ${SOURCE_GIT_TOKEN}" \
+            "${SOURCE_GIT_API}/projects/${SOURCE_GIT_PROJECT}/repository/archive?sha=${SHA}" \
             -o src.zip
 
           python3 - <<'PY'
@@ -137,9 +137,9 @@ jobs:
         run: |
           set -euo pipefail
 
-          python3 .github/scripts/assert-files.py \\
-            --root src \\
-            --files README.md,AGENTS.md,Cargo.toml,rust-toolchain.toml,docs/git-tool.md,docs/bundle-tool.md,tools/git-tool/release.toml,tools/git-tool/release.py,tools/bundle-tool/release.toml,tools/bundle-tool/release.py \\
+          python3 .github/scripts/assert-files.py \
+            --root src \
+            --files README.md,AGENTS.md,Cargo.toml,rust-toolchain.toml,docs/git-tool.md,docs/bundle-tool.md,tools/git-tool/release.toml,tools/git-tool/release.py,tools/bundle-tool/release.toml,tools/bundle-tool/release.py \
             --globs git-tool/Cargo.toml,bundle-tool/Cargo.toml
 
       - name: upload-src
@@ -150,7 +150,7 @@ jobs:
           retention-days: 1
 
   build:
-    needs: validate
+    needs: [validate, fetch]
     strategy:
       fail-fast: false
       matrix:
@@ -188,11 +188,11 @@ jobs:
           BT=./target/release/bundle-tool
           if [[ "${{ matrix.target }}" == windows-* ]]; then BT=./target/release/bundle-tool.exe; fi
 
-          "$BT" run --source tools/git-tool \\
-            --output pkg-out/pkg-git-tool-${{ matrix.target }} \\
+          "$BT" run --source tools/git-tool \
+            --output pkg-out/pkg-git-tool-${{ matrix.target }} \
             --tag "$TAG" --sha "$SHA" --rid "$RID"
-          "$BT" run --source tools/bundle-tool \\
-            --output pkg-out/pkg-bundle-tool-${{ matrix.target }} \\
+          "$BT" run --source tools/bundle-tool \
+            --output pkg-out/pkg-bundle-tool-${{ matrix.target }} \
             --tag "$TAG" --sha "$SHA" --rid "$RID"
 
           ls -R pkg-out
@@ -268,10 +268,10 @@ jobs:
 
           cd src
           cargo build --release --locked -p bundle-tool
-          ./target/release/bundle-tool assemble \\
-            --input ../packages \\
-            --usage-dir ../usage \\
-            --output ../release-bundle \\
+          ./target/release/bundle-tool assemble \
+            --input ../packages \
+            --usage-dir ../usage \
+            --output ../release-bundle \
             --tag "$TAG" --sha "$SHA" --rid "$RID"
 
           ls -R ../release-bundle

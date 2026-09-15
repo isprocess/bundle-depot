@@ -54,7 +54,7 @@ class P396177ContractTest(unittest.TestCase):
         for name in JOBS:
             self.assertIn(name, jobs)
         self.assertIn("needs: validate", jobs["fetch"])
-        self.assertIn("needs: validate", jobs["build"])
+        self.assertIn("needs: [validate, fetch]", jobs["build"])
         self.assertIn("needs: [validate, build]", jobs["prepare-bundle"])
         self.assertIn("needs: [validate, prepare-bundle]", jobs["publish"])
 
