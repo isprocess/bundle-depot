@@ -200,7 +200,7 @@ def start_stub(state: SourceState) -> tuple[str, Callable[[], None]]:
             if path == "/projects/396177/releases":
                 body = self.read_json_body()
                 state.release = {
-                    "tag_name": body["tag_name"],
+                    "tag_name": body["tag"],
                     "name": body["name"],
                     "description": body["description"],
                     "type": body["type"],

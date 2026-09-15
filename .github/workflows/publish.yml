@@ -383,7 +383,7 @@ jobs:
                       method = 'PUT'
                   else:
                       path = f"/projects/{quote(project)}/releases"
-                      payload = {'tag_name': tag, 'name': tag, 'description': body, 'type': release_type}
+                      payload = {'tag': tag, 'name': tag, 'description': body, 'type': release_type}
                       ok = (200, 201)
                       method = 'POST'
                   status, _ = self.json_request(method, path, 'save release', payload, ok=ok)
