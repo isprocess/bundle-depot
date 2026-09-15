@@ -185,8 +185,11 @@ jobs:
 
           cd src
           cargo build --release --locked -p bundle-tool
-          BT=./target/release/bundle-tool
-          if [[ "${{ matrix.target }}" == windows-* ]]; then BT=./target/release/bundle-tool.exe; fi
+          BT=./bt-runner
+          if [[ "${{ matrix.target }}" == windows-* ]]; then BT=./bt-runner.exe; fi
+          SRC_BT=./target/release/bundle-tool
+          if [[ "${{ matrix.target }}" == windows-* ]]; then SRC_BT=./target/release/bundle-tool.exe; fi
+          cp "$SRC_BT" "$BT"
 
           "$BT" run --source tools/bundle-tool \
             --output pkg-out/pkg-bundle-tool-${{ matrix.target }} \
