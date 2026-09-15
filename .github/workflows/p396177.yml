@@ -194,12 +194,14 @@ jobs:
           "$BT" run --source tools/bundle-tool \
             --output pkg-out/pkg-bundle-tool-${{ matrix.target }} \
             --tag "$TAG" --sha "$SHA" --rid "$RID" || { \
-            echo "--- plugin failed; replaying with visible output ---"; \
-            mkdir -p pkg-out/debug-bundle-tool \
+            echo "--- plugin failed; diagnostics ---"; \
+            ls -l target/release/ | head -20; \
+            mkdir -p pkg-out/debug-bundle-tool; \
             BUNDLE_TAG="$TAG" BUNDLE_SOURCE_COMMIT_SHA="$SHA" BUNDLE_REQUEST_ID="$RID" \
-            BUNDLE_SOURCE_ROOT="$PWD/tools/bundle-tool" \
-            BUNDLE_OUTPUT_DIR="$PWD/pkg-out/debug-bundle-tool" \
-            python3 tools/bundle-tool/release.py || true; exit 1; }
+              BUNDLE_SOURCE_ROOT="$PWD/tools/bundle-tool" \
+              BUNDLE_OUTPUT_DIR="$PWD/pkg-out/debug-bundle-tool" \
+              python3 tools/bundle-tool/release.py || true; \
+            exit 1; }
 
           ls -R pkg-out
 
