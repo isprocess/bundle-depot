@@ -7,6 +7,7 @@ import subprocess
 import tempfile
 import unittest
 import urllib.parse
+import zipfile
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -15,22 +16,21 @@ from typing import Callable
 
 ROOT = Path(__file__).resolve().parents[2]
 WORKFLOW = ROOT / ".github" / "workflows" / "publish.yml"
-TAG = "v0.2.0"
-VERSION = "0.2.0"
+TEST_FILE = Path(__file__).resolve()
+PROJECT = "396177"
+NAME = "git-tool"
+TAG = "v0.3.0"
+VERSION = "0.3.0"
 SHA = "0123456789abcdef0123456789abcdef01234567"
-RID = "b-0.2.0-0123456789ab-20260914T120000Z"
-ASSET_NAMES = [
-    "bundle-tool-linux-x64.bin",
-    "bundle-tool-macos-arm64.bin",
-    "bundle-tool-macos-x64.bin",
-    "bundle-tool-usage.md",
-    "bundle-tool-windows-x64.exe",
-    "git-tool-linux-x64.bin",
-    "git-tool-macos-arm64.bin",
-    "git-tool-macos-x64.bin",
-    "git-tool-usage.md",
-    "git-tool-windows-x64.exe",
+RID = "b-0.3.0-0123456789ab-20260916T120000Z"
+META = NAME + "-v" + VERSION + "-meta.zip"
+PLATFORM_FILES = [
+    ("git-tool-linux-x64", "linux-x64"),
+    ("git-tool-windows-x64.exe", "windows-x64"),
+    ("git-tool-macos-x64", "macos-x64"),
+    ("git-tool-macos-arm64", "macos-arm64"),
 ]
+PLATFORM_NAMES = [name for name, _ in PLATFORM_FILES]
 
 
 def extract_inline_script(workflow_path: Path) -> str:
@@ -58,57 +58,68 @@ def write_json(path: Path, value: dict) -> None:
     path.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
+def write_meta_zip(path: Path, checksums: str, manifest: dict, usage: str) -> None:
+    manifest_text = json.dumps(manifest, ensure_ascii=False, indent=2) + "\n"
+    with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("checksums.txt", checksums)
+        archive.writestr("manifest.json", manifest_text)
+        archive.writestr("usage.md", usage)
+
+
+def rewrite_meta_zip(bundle: Path, checksums=None, manifest=None, usage=None) -> None:
+    meta_path = bundle / "upload" / META
+    with zipfile.ZipFile(meta_path, "r") as archive:
+        current_checksums = archive.read("checksums.txt").decode("utf-8")
+        current_manifest = json.loads(archive.read("manifest.json").decode("utf-8"))
+        current_usage = archive.read("usage.md").decode("utf-8")
+    write_meta_zip(
+        meta_path,
+        current_checksums if checksums is None else checksums,
+        current_manifest if manifest is None else manifest,
+        current_usage if usage is None else usage,
+    )
+
+
 def make_valid_bundle(root: Path, tag: str = TAG, sha: str = SHA, rid: str = RID) -> Path:
     bundle = root / "release-bundle"
-    assets = bundle / "assets"
-    assets.mkdir(parents=True)
+    upload = bundle / "upload"
+    upload.mkdir(parents=True)
     file_meta = {}
-    for name in ASSET_NAMES:
+    for name, _platform in PLATFORM_FILES:
         data = f"{name}\n{sha}\n".encode("utf-8")
-        (assets / name).write_bytes(data)
+        (upload / name).write_bytes(data)
         file_meta[name] = {"size": len(data), "sha256": sha256_bytes(data)}
 
-    def entry(name: str, platform: str) -> dict:
+    files = []
+    for name, platform in PLATFORM_FILES:
         meta = file_meta[name]
-        return {"name": name, "platform": platform, "size": meta["size"], "sha256": meta["sha256"]}
+        files.append({"name": name, "platform": platform, "size": meta["size"], "sha256": meta["sha256"]})
 
-    manifest_name = f"git-doc-{VERSION}-manifest.json"
-    checksums_name = f"git-doc-{VERSION}-checksums.txt"
+    checksum_names = sorted(PLATFORM_NAMES, key=lambda name: name.encode("ascii"))
+    checksums = "\n".join(
+        f"{file_meta[name]['sha256']}  {name}" for name in checksum_names
+    ) + "\n"
     manifest = {
-        "contract_version": "release.v3",
+        "contract_version": "release.v4",
+        "kind": "files",
+        "name": NAME,
         "tag": tag,
         "version": VERSION,
         "source_commit_sha": sha,
         "request_id": rid,
-        "components": [
-            {"name": "git-tool", "version": VERSION, "files": [
-                entry("git-tool-linux-x64.bin", "linux-x64"),
-                entry("git-tool-macos-arm64.bin", "macos-arm64"),
-                entry("git-tool-macos-x64.bin", "macos-x64"),
-                entry("git-tool-usage.md", "any"),
-                entry("git-tool-windows-x64.exe", "windows-x64"),
-            ]},
-            {"name": "bundle-tool", "version": VERSION, "files": [
-                entry("bundle-tool-linux-x64.bin", "linux-x64"),
-                entry("bundle-tool-macos-arm64.bin", "macos-arm64"),
-                entry("bundle-tool-macos-x64.bin", "macos-x64"),
-                entry("bundle-tool-usage.md", "any"),
-                entry("bundle-tool-windows-x64.exe", "windows-x64"),
-            ]},
-        ],
+        "files": files,
     }
-    write_json(assets / manifest_name, manifest)
-    targets = sorted(ASSET_NAMES + [manifest_name])
-    checksums = [f"{sha256_bytes((assets / name).read_bytes())}  {name}" for name in targets]
-    (assets / checksums_name).write_text("\n".join(checksums) + "\n", encoding="utf-8")
+    write_meta_zip(upload / META, checksums, manifest, "usage\n")
+    uploads = sorted(PLATFORM_NAMES + [META], key=lambda name: name.encode("ascii"))
     write_json(bundle / "publish.json", {
-        "schema": "publish.v1",
+        "schema": "publish.v2",
         "kind": "files",
+        "name": NAME,
         "tag": tag,
         "sha": sha,
         "rid": rid,
-        "manifest": manifest_name,
-        "checksums": checksums_name,
+        "meta": META,
+        "uploads": uploads,
     })
     (bundle / "release-notes.md").write_text("release notes\n", encoding="utf-8")
     return bundle
@@ -148,6 +159,11 @@ def injected_status(state: SourceState, method: str, path: str) -> int | None:
 
 
 def start_stub(state: SourceState) -> tuple[str, Callable[[], None]]:
+    tag_path = f"/projects/{PROJECT}/repository/tags/{TAG}"
+    release_path = f"/projects/{PROJECT}/releases/{TAG}"
+    create_path = f"/projects/{PROJECT}/releases"
+    attach_path = f"{release_path}/attachments"
+
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, fmt: str, *args) -> None:
             return
@@ -167,12 +183,12 @@ def start_stub(state: SourceState) -> tuple[str, Callable[[], None]]:
             if injected is not None:
                 self.send_json(injected, {"message": "injected"})
                 return
-            if path == "/projects/396177/repository/tags/v0.2.0":
+            if path == tag_path:
                 state.tag_reads += 1
                 sha = "f" * 40 if state.flip_sha_after_tag_reads is not None and state.tag_reads > state.flip_sha_after_tag_reads else state.tag_sha
                 self.send_json(200, {"name": TAG, "commit": {"id": sha}})
                 return
-            if path == "/projects/396177/releases/v0.2.0":
+            if path == release_path:
                 if state.release is None:
                     self.send_json(404, {"message": "not found"})
                 else:
@@ -197,7 +213,7 @@ def start_stub(state: SourceState) -> tuple[str, Callable[[], None]]:
             if injected is not None:
                 self.send_json(injected, {"message": "injected"})
                 return
-            if path == "/projects/396177/releases":
+            if path == create_path:
                 body = self.read_json_body()
                 state.release = {
                     "tag_name": body["tag"],
@@ -207,7 +223,7 @@ def start_stub(state: SourceState) -> tuple[str, Callable[[], None]]:
                 }
                 self.send_json(201, state.release)
                 return
-            if path == "/projects/396177/releases/v0.2.0/attachments":
+            if path == attach_path:
                 name = self.headers.get("X-Test-Filename")
                 size = int(self.headers.get("X-Test-Size", "-1"))
                 if not name or size < 0:
@@ -225,7 +241,7 @@ def start_stub(state: SourceState) -> tuple[str, Callable[[], None]]:
             if injected is not None:
                 self.send_json(injected, {"message": "injected"})
                 return
-            if path == "/projects/396177/releases/v0.2.0":
+            if path == release_path:
                 body = self.read_json_body()
                 current = state.release or {"tag_name": TAG, "name": TAG}
                 current["description"] = body["description"]
@@ -242,7 +258,7 @@ def start_stub(state: SourceState) -> tuple[str, Callable[[], None]]:
             if injected is not None:
                 self.send_json(injected, {"message": "injected"})
                 return
-            prefix = "/projects/396177/releases/v0.2.0/attachments/"
+            prefix = attach_path + "/"
             if path.startswith(prefix):
                 name = urllib.parse.unquote(path[len(prefix):])
                 state.attachments.pop(name, None)
@@ -267,7 +283,7 @@ def run_publish(bundle: Path, state: SourceState) -> subprocess.CompletedProcess
     try:
         env = {
             "SOURCE_API": api,
-            "SOURCE_PROJECT": "396177",
+            "SOURCE_PROJECT": PROJECT,
             "SOURCE_TOKEN": "test-token",
             "PUBLISH_TAG": TAG,
             "PUBLISH_SHA": SHA,
@@ -281,16 +297,23 @@ def run_publish(bundle: Path, state: SourceState) -> subprocess.CompletedProcess
 
 
 def expected_remote_assets(bundle: Path) -> dict[str, int]:
-    return {path.name: path.stat().st_size for path in sorted((bundle / "assets").iterdir())}
+    return {path.name: path.stat().st_size for path in sorted((bundle / "upload").iterdir())}
 
 
-def managed_description(state: str = "release", sha: str = SHA) -> str:
-    return (
-        "<!-- release-envelope.v1\n"
-        '{"schema":"release-envelope.v1","state":"' + state + '","kind":"files","tag":"' + TAG + '",'
-        '"source_commit_sha":"' + sha + '","request_id":"' + RID + '","manifest":"git-doc-0.2.0-manifest.json"}\n'
-        "-->\n\nGenerated summary\n"
-    )
+def managed_description(state: str = "release", sha: str = SHA, published_once: bool = True) -> str:
+    envelope = {
+        "schema": "release-envelope.v2",
+        "state": state,
+        "published_once": published_once,
+        "kind": "files",
+        "name": NAME,
+        "tag": TAG,
+        "source_commit_sha": sha,
+        "request_id": RID,
+        "meta": META,
+    }
+    compact = json.dumps(envelope, ensure_ascii=False, separators=(",", ":"))
+    return "<!-- release-envelope.v2\n" + compact + "\n-->\n\nGenerated summary\n"
 
 
 class PublishTransactionTest(unittest.TestCase):
@@ -301,7 +324,7 @@ class PublishTransactionTest(unittest.TestCase):
         script = extract_inline_script(WORKFLOW)
         env = {
             "SOURCE_API": "http://127.0.0.1:9",
-            "SOURCE_PROJECT": "396177",
+            "SOURCE_PROJECT": PROJECT,
             "SOURCE_TOKEN": "test-token",
             "PUBLISH_TAG": TAG,
             "PUBLISH_SHA": SHA,
@@ -322,9 +345,9 @@ class PublishTransactionTest(unittest.TestCase):
     def test_local_validation_rejects_duplicate_publish_key_before_network(self) -> None:
         def mutate(bundle: Path) -> None:
             (bundle / "publish.json").write_text(
-                '{"schema":"publish.v1","schema":"publish.v1","kind":"files","tag":"' + TAG +
-                '","sha":"' + SHA + '","rid":"' + RID +
-                '","manifest":"git-doc-0.2.0-manifest.json","checksums":"git-doc-0.2.0-checksums.txt"}\n',
+                '{"schema":"publish.v2","schema":"publish.v2","kind":"files","name":"' + NAME +
+                '","tag":"' + TAG + '","sha":"' + SHA + '","rid":"' + RID +
+                '","meta":"' + META + '","uploads":[]}\n',
                 encoding="utf-8",
             )
         self.assert_local_failure(mutate, "publish.json contains duplicate keys")
@@ -338,29 +361,38 @@ class PublishTransactionTest(unittest.TestCase):
 
     def test_local_validation_rejects_missing_checksum_entry(self) -> None:
         def mutate(bundle: Path) -> None:
-            path = bundle / "assets" / "git-doc-0.2.0-checksums.txt"
-            lines = path.read_text(encoding="utf-8").splitlines()
-            path.write_text("\n".join(lines[:-1]) + "\n", encoding="utf-8")
+            lines = []
+            with zipfile.ZipFile(bundle / "upload" / META) as archive:
+                lines = archive.read("checksums.txt").decode("utf-8").splitlines()
+            rewrite_meta_zip(bundle, checksums="\n".join(lines[:-1]) + "\n")
+        self.assert_local_failure(mutate, "checksums coverage mismatch")
+
+    def test_local_validation_rejects_checksums_covering_meta(self) -> None:
+        def mutate(bundle: Path) -> None:
+            meta_path = bundle / "upload" / META
+            digest = sha256_bytes(meta_path.read_bytes())
+            with zipfile.ZipFile(meta_path) as archive:
+                text = archive.read("checksums.txt").decode("utf-8")
+            rewrite_meta_zip(bundle, checksums=text + f"{digest}  {META}\n")
         self.assert_local_failure(mutate, "checksums coverage mismatch")
 
     def test_local_validation_rejects_notes_bom(self) -> None:
         def mutate(bundle: Path) -> None:
             (bundle / "release-notes.md").write_bytes(b"\xef\xbb\xbfbad\n")
         self.assert_local_failure(mutate, "release-notes.md has UTF-8 BOM")
+
     def test_existing_release_with_different_sha_fails_before_staging(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             bundle = make_valid_bundle(Path(tmp))
             state = SourceState(release={
-                "description": '<!-- release-envelope.v1\n'
-                '{"schema":"release-envelope.v1","state":"release","kind":"files","tag":"v0.2.0",'
-                '"source_commit_sha":"ffffffffffffffffffffffffffffffffffffffff","request_id":"b-0.2.0-ffffffffffff-20260914T120000Z",'
-                '"manifest":"git-doc-0.2.0-manifest.json"}\n'
-                '-->\n',
+                "description": managed_description(sha="f" * 40, published_once=True),
                 "type": "release",
             })
             result = self.run_publish(bundle, state)
             self.assertNotEqual(result.returncode, 0)
-            self.assertIn("source SHA does not match", result.stderr + result.stdout)
+            output = result.stderr + result.stdout
+            self.assertIn("source SHA does not match", output)
+            self.assertIn("published_once=true", output)
             self.assertFalse(any(item.startswith("PUT ") or item.startswith("POST ") for item in state.requests))
 
     def test_existing_release_without_envelope_fails_before_staging(self) -> None:
@@ -372,7 +404,23 @@ class PublishTransactionTest(unittest.TestCase):
             self.assertIn("managed envelope", result.stderr + result.stdout)
             self.assertFalse(any(item.startswith("PUT ") or item.startswith("POST ") for item in state.requests))
 
-    def test_valid_release_v3_bundle_publishes_exact_assets(self) -> None:
+    def test_existing_release_with_old_envelope_fails_before_staging(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            bundle = make_valid_bundle(Path(tmp))
+            old_schema = "release-envelope.v" + "1"
+            state = SourceState(release={
+                "description": "<!-- " + old_schema + "\n"
+                + '{"schema":"' + old_schema + '","state":"release","kind":"files","tag":"' + TAG + '",'
+                + '"source_commit_sha":"' + SHA + '","request_id":"' + RID + '","manifest":"unused.json"}\n'
+                + "-->\n",
+                "type": "release",
+            })
+            result = self.run_publish(bundle, state)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("managed envelope", result.stderr + result.stdout)
+            self.assertFalse(any(item.startswith("PUT ") or item.startswith("POST ") for item in state.requests))
+
+    def test_valid_release_v4_bundle_publishes_exact_upload_files(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             bundle = make_valid_bundle(Path(tmp))
             state = SourceState()
@@ -380,9 +428,15 @@ class PublishTransactionTest(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
             self.assertIsNotNone(state.release)
             self.assertEqual(state.release["type"], "release")
-            self.assertTrue(state.release["description"].startswith("<!-- release-envelope.v1\n"))
-            self.assertIn("<!-- release-notes.v1 -->", state.release["description"])
+            description = state.release["description"]
+            self.assertTrue(description.startswith("<!-- release-envelope.v2\n"))
+            self.assertIn('"published_once":true', description)
+            self.assertIn("<!-- release-notes.v1 -->", description)
             self.assertEqual(state.attachments, expected_remote_assets(bundle))
+            self.assertEqual(len(state.attachments), 5)
+            self.assertIn(META, state.attachments)
+            for name in PLATFORM_NAMES:
+                self.assertIn(name, state.attachments)
 
     def test_rerun_replaces_existing_attachments(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -395,6 +449,7 @@ class PublishTransactionTest(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
             self.assertNotIn("stale.bin", state.attachments)
             self.assertEqual(state.attachments, expected_remote_assets(bundle))
+            self.assertIn('"published_once":true', state.release["description"])
 
     def test_second_tag_check_failure_leaves_staging(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -405,12 +460,26 @@ class PublishTransactionTest(unittest.TestCase):
             self.assertIn("second tag/SHA check failed", result.stderr + result.stdout)
             self.assertIsNotNone(state.release)
             self.assertEqual(state.release["type"], "")
+            self.assertIn('"published_once":false', state.release["description"])
             self.assertEqual(state.attachments, expected_remote_assets(bundle))
+
+    def test_published_once_does_not_regress_from_true(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            bundle = make_valid_bundle(Path(tmp))
+            state = SourceState(
+                release={"description": managed_description(published_once=True), "type": "release"},
+                flip_sha_after_tag_reads=1,
+            )
+            result = self.run_publish(bundle, state)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(state.release["type"], "")
+            self.assertIn('"published_once":true', state.release["description"])
+            self.assertNotIn('"published_once":false', state.release["description"])
 
     def test_retryable_500_eventually_succeeds(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             bundle = make_valid_bundle(Path(tmp))
-            state = SourceState(failures={"GET /repository/tags/v0.2.0": [500]})
+            state = SourceState(failures={f"GET /repository/tags/{TAG}": [500]})
             result = self.run_publish(bundle, state)
             self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
             self.assertEqual(state.release["type"], "release")
@@ -418,7 +487,7 @@ class PublishTransactionTest(unittest.TestCase):
     def test_non_retryable_403_fails_without_staging(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             bundle = make_valid_bundle(Path(tmp))
-            state = SourceState(failures={"GET /repository/tags/v0.2.0": [403]})
+            state = SourceState(failures={f"GET /repository/tags/{TAG}": [403]})
             result = self.run_publish(bundle, state)
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("HTTP 403", result.stderr + result.stdout)
@@ -428,7 +497,7 @@ class PublishTransactionTest(unittest.TestCase):
     def test_output_does_not_contain_secret_or_header_name(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             bundle = make_valid_bundle(Path(tmp))
-            state = SourceState(failures={"GET /repository/tags/v0.2.0": [403]})
+            state = SourceState(failures={f"GET /repository/tags/{TAG}": [403]})
             result = self.run_publish(bundle, state)
             output = result.stderr + result.stdout
             for forbidden in ("test-token", "PRIVATE-TOKEN", "SOURCE_TOKEN"):
@@ -439,6 +508,9 @@ class PublishTransactionTest(unittest.TestCase):
         for required in (
             "workflow_call:",
             "actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16",
+            "publish.v2",
+            "release.v4",
+            "release-envelope.v2",
         ):
             self.assertIn(required, text)
         for forbidden in (
@@ -455,9 +527,21 @@ class PublishTransactionTest(unittest.TestCase):
             "GONGFENG_TOKEN",
             "release.v2",
             "container",
+            "release.v" + "3",
+            "publish.v" + "1",
+            "release-envelope.v" + "1",
+            "p" + "396177" + ".yml",
         ):
             self.assertNotIn(forbidden, text)
         self.assertIsNone(re.search(r"[\u4e00-\u9fff]", text))
+        self.assertIn("upload/", text)
+        self.assertNotIn("assets/", text)
+
+    def test_old_dual_component_entry_is_removed(self) -> None:
+        old_workflow = "p" + "396177" + ".yml"
+        old_test = "test-p" + "396177-contract.py"
+        self.assertFalse((ROOT / ".github" / "workflows" / old_workflow).exists())
+        self.assertFalse((ROOT / ".github" / "scripts" / old_test).exists())
 
     def test_inline_script_can_be_extracted_and_compiled(self) -> None:
         script = extract_inline_script(WORKFLOW)
@@ -477,6 +561,12 @@ class PublishTransactionTest(unittest.TestCase):
             "BUNDLE: bundle",
         ):
             self.assertNotIn("\n          " + old_assignment, text)
+
+    def test_test_source_does_not_keep_old_publish_directory(self) -> None:
+        text = TEST_FILE.read_text(encoding="utf-8")
+        self.assertNotIn("p" + "396177" + ".yml", text)
+        self.assertNotIn("bundle / " + chr(34) + "assets" + chr(34), text)
+        self.assertIn("bundle / " + chr(34) + "upload" + chr(34), text)
 
 
 if __name__ == "__main__":

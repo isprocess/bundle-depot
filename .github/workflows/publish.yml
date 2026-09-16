@@ -51,17 +51,17 @@ jobs:
 
           Invoked by publish.yml after the release-bundle artifact has been downloaded:
 
-            1. Validate publish.json, manifest, assets and release-notes.md
-            2. Verify the bundle checksums file covers and matches every asset
+            1. Validate publish.json, meta zip, upload/ files and release-notes.md
+            2. Recompute platform product digests and cross-check publish/manifest/checksums
             3. First tag lookup: the Gongfeng tag must still point at inputs.sha
-            4. Look up the existing Release; if present, strictly parse its managed envelope
-               and require the recorded tag and source SHA to match
+            4. Look up the existing Release; if present, strictly parse release-envelope.v2
+               and require the recorded name, kind, tag and source SHA to match
             5. Enter staging state by explicitly sending "type": ""
             6. Delete every existing attachment
-            7. Upload local attachments one by one over multipart, verifying name and size
+            7. Upload local upload/ files one by one over multipart, verifying name and size
             8. Re-read the remote attachment set and require an exact match
             9. Second tag lookup
-           10. Write the final body and switch to "type": "release"
+           10. Write the final body and switch to "type": "release" with published_once=true
 
           The token only appears in an in-process request header or a 0600 temporary header
           file used by curl; it is never placed on a command line, in a log line or in an
@@ -70,6 +70,7 @@ jobs:
           bypasses the tag/SHA checks and leaves the current remote state in place.
           """
           import hashlib
+          import io
           import json
           import os
           import re
@@ -80,6 +81,7 @@ jobs:
           import urllib.error
           import urllib.parse
           import urllib.request
+          import zipfile
           from dataclasses import dataclass
           from pathlib import Path
 
@@ -88,47 +90,32 @@ jobs:
           RID_RE = re.compile(r'^b-(?P<version>[0-9]+\.[0-9]+\.[0-9]+)-(?P<sha12>[0-9a-f]{12})-[0-9]{8}T[0-9]{6}Z$')
           FILENAME_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._-]*$')
           SAFE_VALUE_RE = re.compile(r'^[A-Za-z0-9._/@:+-]+$')
+          SHA256_RE = re.compile(r'^[0-9a-f]{64}$')
           MAX_ASSET_BYTES = 200 * 1024 * 1024
           RETRY_STATUS = {429, 500, 502, 503, 504}
           RETRY_COUNT = 4
           UPLOAD_TIMEOUT = 300
+          CANONICAL_PLATFORMS = ['linux-x64', 'windows-x64', 'macos-x64', 'macos-arm64']
+          META_ENTRIES = ['checksums.txt', 'manifest.json', 'usage.md']
 
-          PUBLISH_ORDER = ['schema', 'kind', 'tag', 'sha', 'rid', 'manifest', 'checksums']
-          MANIFEST_ORDER = ['contract_version', 'tag', 'version', 'source_commit_sha', 'request_id', 'components']
-          COMPONENT_ORDER = ['name', 'version', 'files']
+          PUBLISH_ORDER = ['schema', 'kind', 'name', 'tag', 'sha', 'rid', 'meta', 'uploads']
+          MANIFEST_ORDER = ['contract_version', 'kind', 'name', 'tag', 'version', 'source_commit_sha', 'request_id', 'files']
           FILE_ORDER = ['name', 'platform', 'size', 'sha256']
-          ENVELOPE_ORDER = ['schema', 'state', 'kind', 'tag', 'source_commit_sha',
-                            'request_id', 'manifest']
-
-          EXPECTED_COMPONENT_FILES = {
-              'git-tool': [
-                  ('git-tool-linux-x64.bin', 'linux-x64'),
-                  ('git-tool-macos-arm64.bin', 'macos-arm64'),
-                  ('git-tool-macos-x64.bin', 'macos-x64'),
-                  ('git-tool-usage.md', 'any'),
-                  ('git-tool-windows-x64.exe', 'windows-x64'),
-              ],
-              'bundle-tool': [
-                  ('bundle-tool-linux-x64.bin', 'linux-x64'),
-                  ('bundle-tool-macos-arm64.bin', 'macos-arm64'),
-                  ('bundle-tool-macos-x64.bin', 'macos-x64'),
-                  ('bundle-tool-usage.md', 'any'),
-                  ('bundle-tool-windows-x64.exe', 'windows-x64'),
-              ],
-          }
-
+          ENVELOPE_ORDER = ['schema', 'state', 'published_once', 'kind', 'name', 'tag', 'source_commit_sha',
+                            'request_id', 'meta']
 
 
           @dataclass(frozen=True)
           class ValidatedBundle:
               publish: dict
               manifest: dict
-              assets_dir: Path
-              asset_paths: list
-              asset_sizes: dict
-              asset_hashes: dict
+              upload_dir: Path
+              upload_paths: list
+              upload_sizes: dict
+              platform_hashes: dict
               notes: str
               version: str
+
 
           def die(message):
               print(f"error: {message}", file=sys.stderr)
@@ -148,8 +135,7 @@ jobs:
                       die(f"{what} contains escaped keys")
 
 
-          def read_text_file(path, what, allow_empty=True):
-              data = path.read_bytes()
+          def decode_text(data, what, allow_empty=True):
               if data.startswith(b"\xef\xbb\xbf"):
                   die(f"{what} has UTF-8 BOM")
               if not allow_empty and not data:
@@ -162,8 +148,11 @@ jobs:
                   die(f"{what} must be UTF-8")
 
 
-          def load_ordered_json(path, what, expected_keys):
-              text = read_text_file(path, what, allow_empty=False)
+          def read_text_file(path, what, allow_empty=True):
+              return decode_text(path.read_bytes(), what, allow_empty=allow_empty)
+
+
+          def load_ordered_json_text(text, what, expected_keys):
               _reject_escaped_keys(text, what)
               try:
                   value = json.loads(text, object_pairs_hook=lambda pairs: _reject_duplicate_pairs(pairs, what))
@@ -174,6 +163,11 @@ jobs:
               if list(value.keys()) != expected_keys:
                   die(f"{what} field set or order is wrong")
               return value
+
+
+          def load_ordered_json(path, what, expected_keys):
+              text = read_text_file(path, what, allow_empty=False)
+              return load_ordered_json_text(text, what, expected_keys)
 
 
           def validate_identity(tag, sha, rid):
@@ -198,9 +192,9 @@ jobs:
               for path in bundle.iterdir():
                   if path.is_symlink():
                       die("release-bundle contains a symbolic link")
-                  if path.name == "assets":
+                  if path.name == "upload":
                       if not path.is_dir():
-                          die("assets must be a directory")
+                          die("upload must be a directory")
                   elif not path.is_file():
                       die("release-bundle contains a non-file entry")
 
@@ -211,64 +205,95 @@ jobs:
               return value
 
 
-          def enumerate_assets(assets_dir):
-              if not assets_dir.is_dir() or assets_dir.is_symlink():
-                  die("assets must be a directory")
+          def enumerate_upload(upload_dir):
+              if not upload_dir.is_dir() or upload_dir.is_symlink():
+                  die("upload must be a directory")
               paths = []
-              for path in assets_dir.iterdir():
+              for path in upload_dir.iterdir():
                   if path.is_symlink() or not path.is_file():
-                      die("assets may contain only regular files")
-                  require_basename(path.name, "asset filename")
+                      die("upload may contain only regular files")
+                  require_basename(path.name, "upload filename")
                   size = path.stat().st_size
                   if size == 0:
-                      die(f"asset {path.name} is empty")
+                      die(f"upload file {path.name} is empty")
                   if size > MAX_ASSET_BYTES:
-                      die(f"asset {path.name} exceeds size limit")
+                      die(f"upload file {path.name} exceeds size limit")
                   paths.append(path)
-              if not paths:
-                  die("assets must not be empty")
+              if not (2 <= len(paths) <= 5):
+                  die("upload must contain 2 to 5 files")
               return sorted(paths, key=lambda path: path.name.encode("ascii"))
 
 
           def sha256_file(path):
-
               digest = hashlib.sha256()
-              with path.open('rb') as f:
-                  for chunk in iter(lambda: f.read(1024 * 1024), b""):
+              with path.open('rb') as handle:
+                  for chunk in iter(lambda: handle.read(1024 * 1024), b""):
                       digest.update(chunk)
               return digest.hexdigest()
 
 
-          def verify_components(components, version, asset_sizes, asset_hashes, manifest_name, checksums_name):
-              if [component.get('name') for component in components] != ['git-tool', 'bundle-tool']:
-                  die("manifest components must be git-tool then bundle-tool")
-              seen = set()
-              for component in components:
-                  if list(component.keys()) != COMPONENT_ORDER or component['version'] != version:
-                      die("manifest component fields are wrong")
-                  expected_files = EXPECTED_COMPONENT_FILES[component['name']]
-                  if [(item.get('name'), item.get('platform')) for item in component['files']] != expected_files:
-                      die("manifest files are missing or out of order")
-                  for item in component['files']:
-                      if list(item.keys()) != FILE_ORDER:
-                          die("manifest file fields are wrong")
-                      name = item['name']
-                      if name in seen or name in (manifest_name, checksums_name, 'publish.json', 'release-notes.md'):
-                          die("manifest contains duplicate or non-asset file")
-                      seen.add(name)
-                      if asset_sizes.get(name) != item['size'] or asset_hashes.get(name) != item['sha256']:
-                          die("manifest file metadata mismatch")
-              expected_names = {name for files in EXPECTED_COMPONENT_FILES.values() for name, _ in files}
-              if seen != expected_names:
-                  die("manifest component file coverage mismatch")
+          def parse_meta_zip(path):
+              data = path.read_bytes()
+              if len(data) < 22:
+                  die("meta zip is too small")
+              try:
+                  archive = zipfile.ZipFile(io.BytesIO(data))
+              except zipfile.BadZipFile:
+                  die("meta zip is not a valid zip")
+              with archive:
+                  if archive.comment:
+                      die("meta zip must not contain a comment")
+                  infos = archive.infolist()
+                  names = [info.filename for info in infos]
+                  if names != META_ENTRIES:
+                      die("meta zip entries are wrong")
+                  for info in infos:
+                      if info.is_dir() or info.filename.endswith('/') or '..' in info.filename or info.filename.startswith('/'):
+                          die("meta zip contains unsafe entries")
+                      if info.flag_bits & 0x8:
+                          die("meta zip must not use data descriptors")
+                      if info.file_size > 0xffffffff or info.compress_size > 0xffffffff:
+                          die("meta zip must not use ZIP64")
+                  checksums = archive.read('checksums.txt')
+                  manifest = archive.read('manifest.json')
+                  usage = archive.read('usage.md')
+              return checksums, manifest, usage
 
 
-          def verify_checksums(path, asset_paths, checksums_name, asset_hashes):
-              lines = read_text_file(path, 'checksums', allow_empty=False).splitlines()
-              expected_names = sorted(
-                  [asset.name for asset in asset_paths if asset.name != checksums_name],
-                  key=lambda name: name.encode('ascii'),
-              )
+          def verify_files(files, platform_sizes, platform_hashes, meta_name):
+              if not isinstance(files, list) or not (1 <= len(files) <= 4):
+                  die("manifest files must contain 1 to 4 platform products")
+              seen_platforms = []
+              seen_names = set()
+              for item in files:
+                  if not isinstance(item, dict) or list(item.keys()) != FILE_ORDER:
+                      die("manifest file fields are wrong")
+                  file_name = require_basename(item['name'], 'manifest file name')
+                  platform = item['platform']
+                  if not isinstance(platform, str) or platform not in CANONICAL_PLATFORMS:
+                      die("manifest contains an unknown platform")
+                  if file_name in seen_names or file_name == meta_name:
+                      die("manifest contains duplicate or non-product file")
+                  seen_names.add(file_name)
+                  seen_platforms.append(platform)
+                  if type(item['size']) is not int or item['size'] <= 0:
+                      die("manifest file size is invalid")
+                  if not isinstance(item['sha256'], str) or not SHA256_RE.fullmatch(item['sha256']):
+                      die("manifest file sha256 is invalid")
+                  if platform_sizes.get(file_name) != item['size'] or platform_hashes.get(file_name) != item['sha256']:
+                      die("manifest file metadata mismatch")
+              if len(seen_platforms) != len(set(seen_platforms)):
+                  die("manifest contains duplicate platforms")
+              expected_platforms = [platform for platform in CANONICAL_PLATFORMS if platform in set(seen_platforms)]
+              if seen_platforms != expected_platforms:
+                  die("manifest files are missing or out of order")
+              if seen_names != set(platform_sizes):
+                  die("manifest file coverage mismatch")
+
+
+          def verify_checksums_text(text, platform_names, platform_hashes):
+              lines = text.splitlines()
+              expected_names = sorted(platform_names, key=lambda name: name.encode('ascii'))
               parsed = []
               for line in lines:
                   match = re.fullmatch(r'([0-9a-f]{64})  ([A-Za-z0-9][A-Za-z0-9._-]*)', line)
@@ -278,37 +303,62 @@ jobs:
               if [name for name, _ in parsed] != expected_names:
                   die("checksums coverage mismatch")
               for name, digest in parsed:
-                  if digest != asset_hashes[name]:
+                  if digest != platform_hashes[name]:
                       die("checksums hash mismatch")
 
 
           def validate_bundle(bundle, tag, sha, rid):
               version = validate_identity(tag, sha, rid)
-              require_exact_top_level(bundle, ['assets', 'publish.json', 'release-notes.md'])
+              require_exact_top_level(bundle, ['publish.json', 'release-notes.md', 'upload'])
               publish = load_ordered_json(bundle / 'publish.json', 'publish.json', PUBLISH_ORDER)
-              if publish['schema'] != 'publish.v1':
-                  die("publish.json schema must be publish.v1")
+              if publish['schema'] != 'publish.v2':
+                  die("publish.json schema must be publish.v2")
               if publish['kind'] != 'files':
                   die("publish.json kind must be files")
+              name = require_basename(publish['name'], 'publish.json name')
               if publish['tag'] != tag or publish['sha'] != sha or publish['rid'] != rid:
                   die("publish.json identity mismatch")
-              assets = bundle / 'assets'
-              manifest_name = require_basename(publish['manifest'], 'manifest')
-              checksums_name = require_basename(publish['checksums'], 'checksums')
-              manifest = load_ordered_json(assets / manifest_name, 'manifest', MANIFEST_ORDER)
-              if manifest['contract_version'] != 'release.v3':
-                  die("manifest contract_version must be release.v3")
+              meta_name = require_basename(publish['meta'], 'publish.json meta')
+              if meta_name != f"{name}-v{version}-meta.zip":
+                  die("publish.json meta name is wrong")
+              uploads = publish['uploads']
+              if not isinstance(uploads, list) or not all(isinstance(item, str) for item in uploads):
+                  die("publish.json uploads must be a list of names")
+              for item in uploads:
+                  require_basename(item, 'publish.json upload name')
+              if uploads != sorted(uploads, key=lambda item: item.encode('ascii')) or len(uploads) != len(set(uploads)):
+                  die("publish.json uploads must be unique and ASCII sorted")
+              if meta_name not in uploads:
+                  die("publish.json uploads must include meta")
+              upload_dir = bundle / 'upload'
+              upload_paths = enumerate_upload(upload_dir)
+              upload_names = [path.name for path in upload_paths]
+              if upload_names != uploads:
+                  die("upload directory does not match publish.json uploads")
+              upload_sizes = {path.name: path.stat().st_size for path in upload_paths}
+              platform_names = [item for item in upload_names if item != meta_name]
+              if not (1 <= len(platform_names) <= 4):
+                  die("upload must contain 1 to 4 platform products plus meta")
+              platform_paths = [path for path in upload_paths if path.name != meta_name]
+              platform_hashes = {path.name: sha256_file(path) for path in platform_paths}
+              platform_sizes = {path.name: path.stat().st_size for path in platform_paths}
+              checksums_bytes, manifest_bytes, usage_bytes = parse_meta_zip(upload_dir / meta_name)
+              checksums_text = decode_text(checksums_bytes, 'checksums', allow_empty=False)
+              manifest_text = decode_text(manifest_bytes, 'manifest', allow_empty=False)
+              decode_text(usage_bytes, 'usage.md', allow_empty=True)
+              manifest = load_ordered_json_text(manifest_text, 'manifest', MANIFEST_ORDER)
+              if manifest['contract_version'] != 'release.v4':
+                  die("manifest contract_version must be release.v4")
+              if manifest['kind'] != 'files' or manifest['name'] != name:
+                  die("manifest identity mismatch")
               if manifest['tag'] != tag or manifest['version'] != version:
                   die("manifest version identity mismatch")
               if manifest['source_commit_sha'] != sha or manifest['request_id'] != rid:
                   die("manifest source identity mismatch")
-              asset_paths = enumerate_assets(assets)
-              asset_hashes = {path.name: sha256_file(path) for path in asset_paths}
-              asset_sizes = {path.name: path.stat().st_size for path in asset_paths}
-              verify_components(manifest['components'], version, asset_sizes, asset_hashes, manifest_name, checksums_name)
-              verify_checksums(assets / checksums_name, asset_paths, checksums_name, asset_hashes)
+              verify_files(manifest['files'], platform_sizes, platform_hashes, meta_name)
+              verify_checksums_text(checksums_text, platform_names, platform_hashes)
               notes = read_text_file(bundle / 'release-notes.md', 'release-notes.md', allow_empty=True)
-              return ValidatedBundle(publish, manifest, assets, asset_paths, asset_sizes, asset_hashes, notes, version)
+              return ValidatedBundle(publish, manifest, upload_dir, upload_paths, upload_sizes, platform_hashes, notes, version)
 
 
           def quote(value):
@@ -449,62 +499,70 @@ jobs:
                       die("upload attachment returned mismatched metadata")
 
 
-          def canonical_envelope(env, what='release-envelope.v1'):
+          def canonical_envelope(env, what='release-envelope.v2'):
               if list(env.keys()) != ENVELOPE_ORDER:
                   die(f"{what} field set or order is wrong")
-              if env['schema'] != 'release-envelope.v1' or env['state'] not in ('staging', 'release') or env['kind'] != 'files':
+              if env['schema'] != 'release-envelope.v2' or env['state'] not in ('staging', 'release') or env['kind'] != 'files':
                   die(f"{what} contains unsupported values")
-              for key, value in env.items():
+              if type(env['published_once']) is not bool:
+                  die(f"{what} published_once must be a boolean")
+              for key in ENVELOPE_ORDER:
+                  if key == 'published_once':
+                      continue
+                  value = env[key]
                   if not isinstance(value, str) or not SAFE_VALUE_RE.match(value):
                       die(f"{what} field {key} is not safe")
               return '{' + ','.join(f'"{key}":{json.dumps(env[key], separators=(",", ":"))}' for key in ENVELOPE_ORDER) + '}'
 
 
-          def parse_managed_envelope(description, tag, sha, kind, manifest):
+          def parse_managed_envelope(description, tag, sha, kind, name):
               if description.startswith('\ufeff') or description[:1].isspace():
                   die("managed envelope must start at byte 0")
               lines = description.split('\n')
-              if len(lines) < 3 or lines[0] != '<!-- release-envelope.v1' or lines[2] != '-->':
+              if len(lines) < 3 or lines[0] != '<!-- release-envelope.v2' or lines[2] != '-->':
                   die("existing Release has no managed envelope")
               env = json.loads(lines[1], object_pairs_hook=lambda pairs: _reject_duplicate_pairs(pairs, 'managed envelope'))
               if not isinstance(env, dict) or canonical_envelope(env, 'managed envelope') != lines[1]:
                   die("managed envelope is not canonical")
-              if env['tag'] != tag or env['kind'] != kind or env['manifest'] != manifest:
-                  die("managed envelope identity does not match inputs")
+              published = env['published_once']
+              published_text = 'true' if published else 'false'
+              if env['tag'] != tag or env['kind'] != kind or env['name'] != name:
+                  die(f"managed envelope identity does not match inputs (published_once={published_text})")
               if env['source_commit_sha'] != sha:
-                  die("managed envelope source SHA does not match inputs")
+                  die(f"managed envelope source SHA does not match inputs (published_once={published_text})")
               return env
 
 
           def require_env(name):
-
               value = os.environ.get(name)
               if not value:
                   die(f"missing required input {name}")
               return value
 
 
-          def make_body(state, publish, asset_count, notes):
+          def make_body(state, publish, asset_count, notes, published_once):
               envelope = {
-                  'schema': 'release-envelope.v1',
+                  'schema': 'release-envelope.v2',
                   'state': state,
+                  'published_once': published_once,
                   'kind': 'files',
+                  'name': publish['name'],
                   'tag': publish['tag'],
                   'source_commit_sha': publish['sha'],
                   'request_id': publish['rid'],
-                  'manifest': publish['manifest'],
+                  'meta': publish['meta'],
               }
               summary = chr(10).join([
                   f"Tag: {publish['tag']}",
                   f"SHA: {publish['sha']}",
                   f"RID: {publish['rid']}",
+                  f"Name: {publish['name']}",
                   "Kind: files",
-                  f"Manifest: {publish['manifest']}",
-                  f"Checksums: {publish['checksums']}",
-                  f"Assets: {asset_count}",
+                  f"Meta: {publish['meta']}",
+                  f"Uploads: {asset_count}",
                   "",
               ])
-              body = '<!-- release-envelope.v1' + '\n' + canonical_envelope(envelope) + '\n' + '-->' + '\n' + summary
+              body = '<!-- release-envelope.v2' + '\n' + canonical_envelope(envelope) + '\n' + '-->' + '\n' + summary
               if notes is not None:
                   body += '\n' + '<!-- release-notes.v1 -->' + '\n' + notes
               return body
@@ -518,21 +576,23 @@ jobs:
               if first_sha != sha:
                   die("first tag/SHA check failed")
               exists, release = client.get_release(project, tag)
+              published_once = False
               if exists:
-                  parse_managed_envelope(release.get('description', ''), tag, sha, publish['kind'], publish['manifest'])
-              staging_body = make_body('staging', publish, len(validated.asset_paths), None)
+                  env = parse_managed_envelope(release.get('description', ''), tag, sha, publish['kind'], publish['name'])
+                  published_once = env['published_once']
+              staging_body = make_body('staging', publish, len(validated.upload_paths), None, published_once)
               client.save_release(project, tag, staging_body, '', exists)
               for name in sorted(client.list_attachments(project, tag), key=lambda value: value.encode('ascii')):
                   client.delete_attachment(project, tag, name)
-              for path in validated.asset_paths:
+              for path in validated.upload_paths:
                   client.upload_attachment(project, tag, path)
               remote = client.list_attachments(project, tag)
-              if remote != validated.asset_sizes:
+              if remote != validated.upload_sizes:
                   die("remote attachment set does not match local files")
               second_sha = client.get_tag_sha(project, tag)
               if second_sha != sha:
                   die("second tag/SHA check failed")
-              final_body = make_body('release', publish, len(validated.asset_paths), validated.notes)
+              final_body = make_body('release', publish, len(validated.upload_paths), validated.notes, True)
               client.save_release(project, tag, final_body, 'release', True)
 
 
@@ -549,4 +609,5 @@ jobs:
 
           if __name__ == '__main__':
               main()
+
           PY
