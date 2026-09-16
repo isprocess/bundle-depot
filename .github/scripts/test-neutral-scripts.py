@@ -146,9 +146,8 @@ def start_stub(state):
             if "/repository/archive" in path:
                 self.send_bytes(200, state.archive, "application/zip")
                 return
-            if "/repository/files/" in path:
-                raw_path = path.split("/repository/files/", 1)[1]
-                file_path = urllib.parse.unquote(raw_path)
+            if path.endswith("/repository/files"):
+                file_path = query.get("file_path", [""])[0]
                 ref = query.get("ref", [""])[0]
                 key = (file_path, ref)
                 if key not in state.files and file_path in state.files:
@@ -379,6 +378,8 @@ class NeutralScriptTest(unittest.TestCase):
                 }, args=["--path", "bundle-tool.lock", "--output", str(out)])
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(out.read_text(encoding="utf-8"), bootstrap_lock())
+                self.assertTrue(any("file_path=bundle-tool.lock" in req for req in state.requests))
+                self.assertFalse(any("/repository/files/bundle-tool.lock" in req for req in state.requests))
         finally:
             stop()
 
@@ -454,11 +455,15 @@ class NeutralScriptTest(unittest.TestCase):
                 self.assertNotIn(forbidden, text, f"{name} contains {forbidden}")
             source = text.replace(" ", "")
             self.assertIn("--project", (SCRIPTS / "check-bootstrap-window.py").read_text(encoding="utf-8"))
+            self.assertNotIn("/repository/files/", text, name)
         window = (SCRIPTS / "check-bootstrap-window.py").read_text(encoding="utf-8")
         self.assertIn("--name", window)
         self.assertIn("--tag", window)
         self.assertIn("--sha", window)
         self.assertIn("--lock-file", window)
+        reader = (SCRIPTS / "read-repo-file.py").read_text(encoding="utf-8")
+        self.assertIn("file_path", reader)
+        self.assertIn("/repository/files?", reader)
 
 
 if __name__ == "__main__":

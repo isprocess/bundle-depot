@@ -147,11 +147,11 @@ def default_branch_lock_mode(api, token, project, parse_lock):
     branch = project_info.get("default_branch")
     if not isinstance(branch, str) or not branch:
         die("project default branch is missing")
-    path = urllib.parse.quote("bundle-tool.lock", safe="")
+    query = urllib.parse.urlencode({"file_path": "bundle-tool.lock", "ref": branch})
     url = project_url(
         api,
         project,
-        f"/repository/files/{path}?ref={urllib.parse.quote(branch, safe='')}",
+        f"/repository/files?{query}",
     )
     status, value = http_json(url, token, ok=(200, 404))
     if status == 404:

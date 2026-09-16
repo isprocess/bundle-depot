@@ -72,9 +72,10 @@ def main():
     sha = env("SHA")
     if not SHA_RE.fullmatch(sha):
         die("sha must be a 40-character lowercase hex value")
+    query = urllib.parse.urlencode({"file_path": args.path, "ref": sha})
     url = (
         f"{api}/projects/{urllib.parse.quote(project, safe='')}"
-        f"/repository/files/{urllib.parse.quote(args.path, safe='')}?ref={urllib.parse.quote(sha, safe='')}"
+        f"/repository/files?{query}"
     )
     value = http_json(url, token)
     encoding = value.get("encoding")
