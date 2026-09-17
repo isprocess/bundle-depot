@@ -89,7 +89,7 @@ class P398245ContractTest(unittest.TestCase):
         self.assertIn("read-repo-file.py", prepare)
         self.assertIn("check-bootstrap-window.py", prepare)
         self.assertIn("download-executor.py", prepare)
-        self.assertIn("packages/pkg-linux-x64/assets/bundle-tool-linux-x64", prepare)
+        self.assertIn("packages/pkg-linux-x64/assets/bundle-tool-linux-x64.bin", prepare)
         self.assertIn("bundle-tool assemble", prepare)
         self.assertNotIn("--usage-dir", self.text)
         assemble_lines = [line for line in prepare.splitlines() if "assemble" in line]

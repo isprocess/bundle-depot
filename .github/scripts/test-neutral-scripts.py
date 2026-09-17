@@ -47,10 +47,10 @@ def bootstrap_lock():
 def release_lock(project=42, name="bundle-tool"):
     assets = []
     for platform, asset in (
-        ("linux-x64", "bundle-tool-linux-x64"),
+        ("linux-x64", "bundle-tool-linux-x64.bin"),
         ("windows-x64", "bundle-tool-windows-x64.exe"),
-        ("macos-x64", "bundle-tool-macos-x64"),
-        ("macos-arm64", "bundle-tool-macos-arm64"),
+        ("macos-x64", "bundle-tool-macos-x64.bin"),
+        ("macos-arm64", "bundle-tool-macos-arm64.bin"),
     ):
         assets.append(
             f'[[assets]]\nplatform = "{platform}"\nname = "{asset}"\nsha256 = "{DIGEST}"\n'
@@ -173,8 +173,8 @@ def start_stub(state):
                     items.append(row)
                 self.send_json(200, items if items else [])
                 return
-            if "/releases/" in path and path.endswith("/attachments/bundle-tool-linux-x64"):
-                data = state.attachments.get("bundle-tool-linux-x64", b"executor-bytes\n")
+            if "/releases/" in path and path.endswith("/attachments/bundle-tool-linux-x64.bin"):
+                data = state.attachments.get("bundle-tool-linux-x64.bin", b"executor-bytes\n")
                 self.send_bytes(200, data)
                 return
             if "/releases/" in path and "/attachments/" in path:
@@ -341,11 +341,11 @@ class NeutralScriptTest(unittest.TestCase):
         digest = hashlib.sha256(payload).hexdigest()
         lock = release_lock().replace(DIGEST, digest)
         state = SourceState()
-        state.attachments["bundle-tool-linux-x64"] = payload
+        state.attachments["bundle-tool-linux-x64.bin"] = payload
         state.releases[TAG] = {
             "tag_name": TAG,
             "description": envelope(),
-            "attachments": [{"name": "bundle-tool-linux-x64", "size": len(payload)}],
+            "attachments": [{"name": "bundle-tool-linux-x64.bin", "size": len(payload)}],
         }
         api, stop = start_stub(state)
         try:

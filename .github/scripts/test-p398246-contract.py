@@ -89,7 +89,7 @@ class P398246ContractTest(unittest.TestCase):
         prepare = self.jobs["prepare-bundle"]
         self.assertIn("read-repo-file.py", prepare)
         self.assertIn("download-executor.py", prepare)
-        self.assertNotIn("packages/pkg-linux-x64/assets/bundle-tool-linux-x64", prepare)
+        self.assertNotIn("packages/pkg-linux-x64/assets/bundle-tool-linux-x64.bin", prepare)
         self.assertIn("bootstrap mode is not allowed", prepare)
         self.assertIn("bundle-tool assemble", prepare)
         self.assertNotIn("--usage-dir", self.text)

@@ -213,7 +213,7 @@ jobs:
         if: steps.lock.outputs.mode == 'bootstrap'
         run: |
           set -euo pipefail
-          cp packages/pkg-linux-x64/assets/bundle-tool-linux-x64 "$RUNNER_TEMP"/bundle-tool
+          cp packages/pkg-linux-x64/assets/bundle-tool-linux-x64.bin "$RUNNER_TEMP"/bundle-tool
           chmod +x "$RUNNER_TEMP"/bundle-tool
       - name: download-executor
         if: steps.lock.outputs.mode == 'release'
