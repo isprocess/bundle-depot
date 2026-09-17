@@ -94,7 +94,7 @@ jobs:
           MAX_ASSET_BYTES = 200 * 1024 * 1024
           RETRY_STATUS = {429, 500, 502, 503, 504}
           RETRY_COUNT = 4
-          UPLOAD_TIMEOUT = 300
+          UPLOAD_TIMEOUT = 900
           CANONICAL_PLATFORMS = ['linux-x64', 'windows-x64', 'macos-x64', 'macos-arm64']
           META_ENTRIES = ['checksums.txt', 'manifest.json', 'usage.md']
 
@@ -488,7 +488,7 @@ jobs:
                               text=True,
                               capture_output=True,
                               check=False,
-                              timeout=300,
+                              timeout=UPLOAD_TIMEOUT,
                           )
                       finally:
                           Path(header_path).unlink(missing_ok=True)
