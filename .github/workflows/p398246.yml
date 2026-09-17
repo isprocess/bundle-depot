@@ -19,16 +19,19 @@ jobs:
       sha: ${{ steps.check.outputs.sha }}
       rid: ${{ steps.check.outputs.rid }}
     steps:
-      - name: checkout-scripts
+      - name: checkout-executor
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
-          sparse-checkout: .github/scripts
+          sparse-checkout: .github/bin
           sparse-checkout-cone-mode: false
       - name: check-payload
         id: check
         env:
           PAYLOAD: ${{ toJSON(github.event.client_payload) }}
-        run: python3 .github/scripts/check-payload.py
+        run: |
+          set -euo pipefail
+          chmod +x .github/bin/bundle-tool-linux-x64.bin
+          .github/bin/bundle-tool-linux-x64.bin check-payload
 
   build:
     needs: validate
@@ -50,10 +53,10 @@ jobs:
       run:
         shell: bash
     steps:
-      - name: checkout-scripts
+      - name: checkout-executor
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
-          sparse-checkout: .github/scripts
+          sparse-checkout: .github/bin
           sparse-checkout-cone-mode: false
       - name: verify-tag
         env:
@@ -62,47 +65,44 @@ jobs:
           SOURCE_GIT_PROJECT: ${{ secrets.SOURCE_GIT_PROJECT_398246 }}
           TAG: ${{ needs.validate.outputs.tag }}
           SHA: ${{ needs.validate.outputs.sha }}
+          TARGET: ${{ matrix.target }}
         run: |
           set -euo pipefail
-          python3 .github/scripts/verify-tag.py
+          EXEC="$GITHUB_WORKSPACE/.github/bin/bundle-tool-$TARGET"
+          case "$TARGET" in
+            windows-*) EXEC="$EXEC.exe" ;;
+            *) EXEC="$EXEC.bin" ;;
+          esac
+          chmod +x "$EXEC"
+          "$EXEC" verify-tag
       - name: fetch-source
         env:
           SOURCE_GIT_TOKEN: ${{ secrets.SOURCE_GIT_TOKEN }}
           SOURCE_GIT_API: ${{ secrets.SOURCE_GIT_API }}
           SOURCE_GIT_PROJECT: ${{ secrets.SOURCE_GIT_PROJECT_398246 }}
           SHA: ${{ needs.validate.outputs.sha }}
-        run: |
-          set -euo pipefail
-          python3 .github/scripts/fetch-source.py --output src
-      - name: assert-files
-        run: |
-          set -euo pipefail
-          python3 .github/scripts/assert-files.py --root src --files Cargo.toml,rust-toolchain.toml,release.toml,release.py,docs/usage.md,bundle-tool.lock,src/main.rs
-      - name: parse-lock
-        id: lock
-        run: |
-          set -euo pipefail
-          python3 .github/scripts/parse-lock.py --lock-file src/bundle-tool.lock
-      - name: reject-bootstrap
-        run: |
-          set -euo pipefail
-          if [[ "${{ steps.lock.outputs.mode }}" == "bootstrap" ]]; then
-            echo "error: bootstrap mode is not allowed" >&2
-            exit 1
-          fi
-      - name: download-executor
-        env:
-          SOURCE_GIT_TOKEN: ${{ secrets.SOURCE_GIT_TOKEN }}
-          SOURCE_GIT_API: ${{ secrets.SOURCE_GIT_API }}
           TARGET: ${{ matrix.target }}
         run: |
           set -euo pipefail
-          OUT="$RUNNER_TEMP"/bundle-tool
-          if [[ "$TARGET" == windows-* ]]; then
-            OUT="$RUNNER_TEMP"/bundle-tool.exe
-          fi
-          python3 .github/scripts/download-executor.py --lock-file src/bundle-tool.lock --platform "$TARGET" --output "$OUT"
-          chmod +x "$OUT"
+          EXEC="$GITHUB_WORKSPACE/.github/bin/bundle-tool-$TARGET"
+          case "$TARGET" in
+            windows-*) EXEC="$EXEC.exe" ;;
+            *) EXEC="$EXEC.bin" ;;
+          esac
+          chmod +x "$EXEC"
+          "$EXEC" fetch-source --output src
+      - name: assert-files
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          EXEC="$GITHUB_WORKSPACE/.github/bin/bundle-tool-$TARGET"
+          case "$TARGET" in
+            windows-*) EXEC="$EXEC.exe" ;;
+            *) EXEC="$EXEC.bin" ;;
+          esac
+          chmod +x "$EXEC"
+          "$EXEC" assert-files --root src --files Cargo.toml,rust-toolchain.toml,release.toml,release.py,docs/usage.md,src/main.rs
       - name: run-plugin
         env:
           TAG: ${{ needs.validate.outputs.tag }}
@@ -111,12 +111,14 @@ jobs:
           TARGET: ${{ matrix.target }}
         run: |
           set -euo pipefail
-          EXEC="$RUNNER_TEMP"/bundle-tool
-          if [[ "$TARGET" == windows-* ]]; then
-            EXEC="$RUNNER_TEMP"/bundle-tool.exe
-          fi
+          EXEC="$GITHUB_WORKSPACE/.github/bin/bundle-tool-$TARGET"
+          case "$TARGET" in
+            windows-*) EXEC="$EXEC.exe" ;;
+            *) EXEC="$EXEC.bin" ;;
+          esac
+          chmod +x "$EXEC"
           cd src
-          "$EXEC" run --source . --output "$RUNNER_TEMP"/pkg-${{ matrix.target }} --tag "$TAG" --sha "$SHA" --rid "$RID" --platform ${{ matrix.target }}
+          "$EXEC" run --source . --output "$RUNNER_TEMP/pkg-$TARGET" --tag "$TAG" --sha "$SHA" --rid "$RID" --platform "$TARGET"
       - name: upload-pkg
         uses: actions/upload-artifact@50769540e7f4bd5e21e526ee35c689e35e0d6874
         with:
@@ -130,10 +132,10 @@ jobs:
     runs-on: ubuntu-22.04
     permissions: {}
     steps:
-      - name: checkout-scripts
+      - name: checkout-executor
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
-          sparse-checkout: .github/scripts
+          sparse-checkout: .github/bin
           sparse-checkout-cone-mode: false
       - name: fetch-pkg-linux
         uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16
@@ -164,36 +166,8 @@ jobs:
           SHA: ${{ needs.validate.outputs.sha }}
         run: |
           set -euo pipefail
-          python3 .github/scripts/verify-tag.py
-      - name: read-lock
-        env:
-          SOURCE_GIT_TOKEN: ${{ secrets.SOURCE_GIT_TOKEN }}
-          SOURCE_GIT_API: ${{ secrets.SOURCE_GIT_API }}
-          SOURCE_GIT_PROJECT: ${{ secrets.SOURCE_GIT_PROJECT_398246 }}
-          SHA: ${{ needs.validate.outputs.sha }}
-        run: |
-          set -euo pipefail
-          python3 .github/scripts/read-repo-file.py --path bundle-tool.lock --output bundle-tool.lock
-      - name: parse-lock
-        id: lock
-        run: |
-          set -euo pipefail
-          python3 .github/scripts/parse-lock.py --lock-file bundle-tool.lock
-      - name: reject-bootstrap
-        run: |
-          set -euo pipefail
-          if [[ "${{ steps.lock.outputs.mode }}" == "bootstrap" ]]; then
-            echo "error: bootstrap mode is not allowed" >&2
-            exit 1
-          fi
-      - name: download-executor
-        env:
-          SOURCE_GIT_TOKEN: ${{ secrets.SOURCE_GIT_TOKEN }}
-          SOURCE_GIT_API: ${{ secrets.SOURCE_GIT_API }}
-        run: |
-          set -euo pipefail
-          python3 .github/scripts/download-executor.py --lock-file bundle-tool.lock --platform linux-x64 --output "$RUNNER_TEMP"/bundle-tool
-          chmod +x "$RUNNER_TEMP"/bundle-tool
+          chmod +x .github/bin/bundle-tool-linux-x64.bin
+          .github/bin/bundle-tool-linux-x64.bin verify-tag
       - name: assemble
         env:
           TAG: ${{ needs.validate.outputs.tag }}
@@ -201,7 +175,8 @@ jobs:
           RID: ${{ needs.validate.outputs.rid }}
         run: |
           set -euo pipefail
-          "$RUNNER_TEMP"/bundle-tool assemble --input packages --output "$GITHUB_WORKSPACE"/release-bundle --tag "$TAG" --sha "$SHA" --rid "$RID"
+          chmod +x .github/bin/bundle-tool-linux-x64.bin
+          .github/bin/bundle-tool-linux-x64.bin assemble --input packages --output "$GITHUB_WORKSPACE/release-bundle" --tag "$TAG" --sha "$SHA" --rid "$RID"
       - name: upload-bundle
         uses: actions/upload-artifact@50769540e7f4bd5e21e526ee35c689e35e0d6874
         with:
