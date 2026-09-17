@@ -90,7 +90,7 @@ jobs:
             *) EXEC="$EXEC.bin" ;;
           esac
           chmod +x "$EXEC"
-          "$EXEC" fetch-source --output src
+          "$EXEC" fetch-source --output "$GITHUB_WORKSPACE/src"
       - name: assert-files
         env:
           TARGET: ${{ matrix.target }}
