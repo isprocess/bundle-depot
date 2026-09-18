@@ -15,10 +15,33 @@ jobs:
     runs-on: ubuntu-22.04
     permissions: {}
     outputs:
+      project: ${{ steps.project.outputs.project }}
       tag: ${{ steps.check.outputs.tag }}
       sha: ${{ steps.check.outputs.sha }}
       rid: ${{ steps.check.outputs.rid }}
     steps:
+      - name: derive-project
+        id: project
+        env:
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+          EVENT_TYPE: ${{ github.event.action }}
+        run: |
+          set -euo pipefail
+          ref_without_revision="${WORKFLOW_REF%%@*}"
+          workflow_file="${ref_without_revision##*/}"
+
+          if [[ ! "$workflow_file" =~ ^p([1-9][0-9]*)\.yml$ ]]; then
+            printf 'invalid project workflow filename: %s\n' "$workflow_file" >&2
+            exit 1
+          fi
+
+          project="${BASH_REMATCH[1]}"
+          if [[ "$EVENT_TYPE" != "build_$project" ]]; then
+            printf 'dispatch event does not match workflow project\n' >&2
+            exit 1
+          fi
+
+          printf 'project=%s\n' "$project" >> "$GITHUB_OUTPUT"
       - name: checkout-executor
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
@@ -60,7 +83,7 @@ jobs:
         env:
           SOURCE_GIT_TOKEN: ${{ secrets.SOURCE_GIT_TOKEN }}
           SOURCE_GIT_API: ${{ secrets.SOURCE_GIT_API }}
-          SOURCE_GIT_PROJECT: ${{ secrets.SOURCE_GIT_PROJECT_398237 }}
+          SOURCE_GIT_PROJECT: ${{ needs.validate.outputs.project }}
           TAG: ${{ needs.validate.outputs.tag }}
           SHA: ${{ needs.validate.outputs.sha }}
           TARGET: ${{ matrix.target }}
@@ -77,7 +100,7 @@ jobs:
         env:
           SOURCE_GIT_TOKEN: ${{ secrets.SOURCE_GIT_TOKEN }}
           SOURCE_GIT_API: ${{ secrets.SOURCE_GIT_API }}
-          SOURCE_GIT_PROJECT: ${{ secrets.SOURCE_GIT_PROJECT_398237 }}
+          SOURCE_GIT_PROJECT: ${{ needs.validate.outputs.project }}
           SHA: ${{ needs.validate.outputs.sha }}
           TARGET: ${{ matrix.target }}
         run: |
@@ -163,7 +186,7 @@ jobs:
         env:
           SOURCE_GIT_TOKEN: ${{ secrets.SOURCE_GIT_TOKEN }}
           SOURCE_GIT_API: ${{ secrets.SOURCE_GIT_API }}
-          SOURCE_GIT_PROJECT: ${{ secrets.SOURCE_GIT_PROJECT_398237 }}
+          SOURCE_GIT_PROJECT: ${{ needs.validate.outputs.project }}
           TAG: ${{ needs.validate.outputs.tag }}
           SHA: ${{ needs.validate.outputs.sha }}
         run: |
@@ -191,10 +214,10 @@ jobs:
     needs: [validate, prepare-bundle]
     uses: ./.github/workflows/publish.yml
     with:
+      project: ${{ needs.validate.outputs.project }}
       tag: ${{ needs.validate.outputs.tag }}
       sha: ${{ needs.validate.outputs.sha }}
       rid: ${{ needs.validate.outputs.rid }}
     secrets:
       api: ${{ secrets.SOURCE_GIT_API }}
-      project: ${{ secrets.SOURCE_GIT_PROJECT_398237 }}
       token: ${{ secrets.SOURCE_GIT_TOKEN }}
