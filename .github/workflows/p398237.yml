@@ -1,0 +1,200 @@
+name: p398237
+
+on:
+  repository_dispatch:
+    types: [build_398237]
+
+permissions: {}
+
+concurrency:
+  group: p398237
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    runs-on: ubuntu-22.04
+    permissions: {}
+    outputs:
+      tag: ${{ steps.check.outputs.tag }}
+      sha: ${{ steps.check.outputs.sha }}
+      rid: ${{ steps.check.outputs.rid }}
+    steps:
+      - name: checkout-executor
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          sparse-checkout: .github/bin
+          sparse-checkout-cone-mode: false
+      - name: check-payload
+        id: check
+        env:
+          PAYLOAD: ${{ toJSON(github.event.client_payload) }}
+        run: |
+          set -euo pipefail
+          chmod +x .github/bin/bundle-tool-linux-x64.bin
+          .github/bin/bundle-tool-linux-x64.bin check-payload
+
+  build:
+    needs: validate
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: linux-x64
+            os: ubuntu-22.04
+          - target: windows-x64
+            os: windows-2022
+          - target: macos-arm64
+            os: macos-14
+    runs-on: ${{ matrix.os }}
+    permissions: {}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: checkout-executor
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          sparse-checkout: .github/bin
+          sparse-checkout-cone-mode: false
+      - name: verify-tag
+        env:
+          SOURCE_GIT_TOKEN: ${{ secrets.SOURCE_GIT_TOKEN }}
+          SOURCE_GIT_API: ${{ secrets.SOURCE_GIT_API }}
+          SOURCE_GIT_PROJECT: ${{ secrets.SOURCE_GIT_PROJECT_398237 }}
+          TAG: ${{ needs.validate.outputs.tag }}
+          SHA: ${{ needs.validate.outputs.sha }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          EXEC="$GITHUB_WORKSPACE/.github/bin/bundle-tool-$TARGET"
+          case "$TARGET" in
+            windows-*) EXEC="$EXEC.exe" ;;
+            *) EXEC="$EXEC.bin" ;;
+          esac
+          chmod +x "$EXEC"
+          "$EXEC" verify-tag
+      - name: fetch-source
+        env:
+          SOURCE_GIT_TOKEN: ${{ secrets.SOURCE_GIT_TOKEN }}
+          SOURCE_GIT_API: ${{ secrets.SOURCE_GIT_API }}
+          SOURCE_GIT_PROJECT: ${{ secrets.SOURCE_GIT_PROJECT_398237 }}
+          SHA: ${{ needs.validate.outputs.sha }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          EXEC="$GITHUB_WORKSPACE/.github/bin/bundle-tool-$TARGET"
+          case "$TARGET" in
+            windows-*) EXEC="$EXEC.exe" ;;
+            *) EXEC="$EXEC.bin" ;;
+          esac
+          chmod +x "$EXEC"
+          "$EXEC" fetch-source --output "$GITHUB_WORKSPACE/src"
+      - name: assert-files
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          EXEC="$GITHUB_WORKSPACE/.github/bin/bundle-tool-$TARGET"
+          case "$TARGET" in
+            windows-*) EXEC="$EXEC.exe" ;;
+            *) EXEC="$EXEC.bin" ;;
+          esac
+          chmod +x "$EXEC"
+          "$EXEC" assert-files \
+            --root src \
+            --files 'AGENTS.md,README.md,Cargo.toml,Cargo.lock,rust-toolchain.toml,.cargo/config.toml,crates/imagegen-installer/Cargo.toml,release.toml,release.py,git-tool.toml,docs/usage.md,scripts/check-release-contract.sh,scripts/dispatch-release.sh,scripts/setup-bundle-depot-secrets.sh,SKILL.md,agents/openai.yaml,references/prompting.md,references/sample-prompts.md,LICENSE-MIT.txt,LICENSE-OPENAI-APACHE-2.0.txt,NOTICE.md' \
+            --globs 'src/**/*.rs,crates/imagegen-installer/src/**/*.rs,tests/**/*.rs'
+      - name: install-musl-tools
+        if: matrix.target == 'linux-x64'
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install --yes musl-tools
+      - name: run-plugin
+        env:
+          TAG: ${{ needs.validate.outputs.tag }}
+          SHA: ${{ needs.validate.outputs.sha }}
+          RID: ${{ needs.validate.outputs.rid }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          EXEC="$GITHUB_WORKSPACE/.github/bin/bundle-tool-$TARGET"
+          case "$TARGET" in
+            windows-*) EXEC="$EXEC.exe" ;;
+            *) EXEC="$EXEC.bin" ;;
+          esac
+          chmod +x "$EXEC"
+          cd src
+          "$EXEC" run --source . --output "$RUNNER_TEMP/pkg-$TARGET" --tag "$TAG" --sha "$SHA" --rid "$RID" --platform "$TARGET"
+      - name: upload-pkg
+        uses: actions/upload-artifact@50769540e7f4bd5e21e526ee35c689e35e0d6874
+        with:
+          name: pkg-${{ matrix.target }}
+          path: ${{ runner.temp }}/pkg-${{ matrix.target }}
+          retention-days: 1
+          if-no-files-found: error
+
+  prepare-bundle:
+    needs: [validate, build]
+    runs-on: ubuntu-22.04
+    permissions: {}
+    steps:
+      - name: checkout-executor
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          sparse-checkout: .github/bin
+          sparse-checkout-cone-mode: false
+      - name: fetch-pkg-linux
+        uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16
+        with:
+          name: pkg-linux-x64
+          path: packages/pkg-linux-x64
+      - name: fetch-pkg-windows
+        uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16
+        with:
+          name: pkg-windows-x64
+          path: packages/pkg-windows-x64
+      - name: fetch-pkg-macos-arm64
+        uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16
+        with:
+          name: pkg-macos-arm64
+          path: packages/pkg-macos-arm64
+      - name: verify-tag
+        env:
+          SOURCE_GIT_TOKEN: ${{ secrets.SOURCE_GIT_TOKEN }}
+          SOURCE_GIT_API: ${{ secrets.SOURCE_GIT_API }}
+          SOURCE_GIT_PROJECT: ${{ secrets.SOURCE_GIT_PROJECT_398237 }}
+          TAG: ${{ needs.validate.outputs.tag }}
+          SHA: ${{ needs.validate.outputs.sha }}
+        run: |
+          set -euo pipefail
+          chmod +x .github/bin/bundle-tool-linux-x64.bin
+          .github/bin/bundle-tool-linux-x64.bin verify-tag
+      - name: assemble
+        env:
+          TAG: ${{ needs.validate.outputs.tag }}
+          SHA: ${{ needs.validate.outputs.sha }}
+          RID: ${{ needs.validate.outputs.rid }}
+        run: |
+          set -euo pipefail
+          chmod +x .github/bin/bundle-tool-linux-x64.bin
+          .github/bin/bundle-tool-linux-x64.bin assemble --input packages --output "$GITHUB_WORKSPACE/release-bundle" --tag "$TAG" --sha "$SHA" --rid "$RID"
+      - name: upload-bundle
+        uses: actions/upload-artifact@50769540e7f4bd5e21e526ee35c689e35e0d6874
+        with:
+          name: release-bundle
+          path: release-bundle/
+          retention-days: 1
+          if-no-files-found: error
+
+  publish:
+    needs: [validate, prepare-bundle]
+    uses: ./.github/workflows/publish.yml
+    with:
+      tag: ${{ needs.validate.outputs.tag }}
+      sha: ${{ needs.validate.outputs.sha }}
+      rid: ${{ needs.validate.outputs.rid }}
+    secrets:
+      api: ${{ secrets.SOURCE_GIT_API }}
+      project: ${{ secrets.SOURCE_GIT_PROJECT_398237 }}
+      token: ${{ secrets.SOURCE_GIT_TOKEN }}
