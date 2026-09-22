@@ -1,5 +1,7 @@
 name: p398245
 
+run-name: "${{ github.event.client_payload.rid }}"
+
 on:
   repository_dispatch:
     types: [build_398245]
@@ -7,7 +9,7 @@ on:
 permissions: {}
 
 concurrency:
-  group: p398245
+  group: p398245-bootstrap
   cancel-in-progress: false
 
 jobs:
@@ -27,35 +29,216 @@ jobs:
           EVENT_TYPE: ${{ github.event.action }}
         run: |
           set -euo pipefail
-          ref_without_revision="${WORKFLOW_REF%%@*}"
-          workflow_file="${ref_without_revision##*/}"
-
-          if [[ ! "$workflow_file" =~ ^p([1-9][0-9]*)\.yml$ ]]; then
-            printf 'invalid project workflow filename: %s\n' "$workflow_file" >&2
+          if command -v python3 >/dev/null 2>&1; then
+            PYBIN=python3
+          elif command -v python >/dev/null 2>&1; then
+            PYBIN=python
+          else
             exit 1
           fi
+          "$PYBIN" - <<'PY'
+          import os
+          import re
+          import sys
 
-          project="${BASH_REMATCH[1]}"
-          if [[ "$EVENT_TYPE" != "build_$project" ]]; then
-            printf 'dispatch event does not match workflow project\n' >&2
-            exit 1
-          fi
-
-          printf 'project=%s\n' "$project" >> "$GITHUB_OUTPUT"
-      - name: checkout-executor
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
-        with:
-          sparse-checkout: .github/bin
-          sparse-checkout-cone-mode: false
+          ref = os.environ["WORKFLOW_REF"]
+          event = os.environ["EVENT_TYPE"]
+          workflow_file = ref.split("@", 1)[0].rsplit("/", 1)[-1]
+          match = re.fullmatch("p([1-9][0-9]*)" + chr(92) + ".yml", workflow_file)
+          if not match:
+              sys.stderr.write("invalid project workflow filename" + chr(10))
+              raise SystemExit(1)
+          project = match.group(1)
+          expected = "build_$project".replace("$project", project)
+          if event != expected or event != "build_398245" or project != "398245":
+              sys.stderr.write("dispatch event does not match workflow project" + chr(10))
+              raise SystemExit(1)
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as handle:
+              handle.write("project=%s%s" % (project, chr(10)))
+          PY
       - name: check-payload
         id: check
         env:
           PAYLOAD: ${{ toJSON(github.event.client_payload) }}
         run: |
           set -euo pipefail
-          chmod +x .github/bin/bundle-tool-linux-x64.bin
-          .github/bin/bundle-tool-linux-x64.bin check-payload
+          if command -v python3 >/dev/null 2>&1; then
+            PYBIN=python3
+          elif command -v python >/dev/null 2>&1; then
+            PYBIN=python
+          else
+            exit 1
+          fi
+          "$PYBIN" - <<'PY'
+          import json
+          import os
+          import sys
 
+          def die(message):
+              sys.stderr.write(str(message) + chr(10))
+              raise SystemExit(1)
+
+          def validate_identity(tag, sha, rid):
+              if len(tag) < 6 or not tag.startswith("v"):
+                  die("invalid tag")
+              parts = tag[1:].split(".")
+              if len(parts) != 3 or any((not part.isdigit()) or (len(part) > 1 and part.startswith("0")) for part in parts):
+                  die("invalid tag")
+              if len(sha) != 40 or any(ch not in "0123456789abcdef" for ch in sha):
+                  die("invalid sha")
+              prefix = "b-%s-%s-" % (tag[1:], sha[:12])
+              if not rid.startswith(prefix) or len(rid) != len(prefix) + 16:
+                  die("invalid rid")
+              stamp = rid[len(prefix):]
+              if not (stamp[:8].isdigit() and stamp[8] == "T" and stamp[9:15].isdigit() and stamp[15] == "Z"):
+                  die("invalid rid")
+
+          raw = os.environ["PAYLOAD"]
+          pairs = json.loads(raw, object_pairs_hook=list)
+          if not isinstance(pairs, list):
+              die("payload is not an object")
+          keys = [key for key, _value in pairs]
+          if len(keys) != 3 or len(set(keys)) != 3 or set(keys) != {"tag", "sha", "rid"}:
+              die("payload is not exact three-field JSON")
+          fields = {}
+          for key, value in pairs:
+              if not isinstance(value, str):
+                  die("payload fields must be strings")
+              fields[key] = value
+          validate_identity(fields["tag"], fields["sha"], fields["rid"])
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as handle:
+              handle.write("tag=%s%ssha=%s%srid=%s%s" % (fields["tag"], chr(10), fields["sha"], chr(10), fields["rid"], chr(10)))
+          PY
+      - name: verify-tag
+        env:
+          SOURCE_GIT_TOKEN: ${{ secrets.SOURCE_GIT_TOKEN }}
+          SOURCE_GIT_API: ${{ secrets.SOURCE_GIT_API }}
+          PROJECT: ${{ steps.project.outputs.project }}
+          TAG: ${{ steps.check.outputs.tag }}
+          SHA: ${{ steps.check.outputs.sha }}
+          RID: ${{ steps.check.outputs.rid }}
+        run: |
+          set -euo pipefail
+          if command -v python3 >/dev/null 2>&1; then
+            PYBIN=python3
+          elif command -v python >/dev/null 2>&1; then
+            PYBIN=python
+          else
+            exit 1
+          fi
+          "$PYBIN" - <<'PY'
+          """Token-authenticated Gongfeng tag and archive reads. No Release writes."""
+
+          import json
+          import os
+          import sys
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+
+
+          def die(message):
+              text = str(message)
+              secret = os.environ.get("SOURCE_GIT_TOKEN") or ""
+              if secret:
+                  text = text.replace(secret, "[redacted]")
+              sys.stderr.write(text + chr(10))
+              raise SystemExit(1)
+
+
+          def validate_identity(project, tag, sha, rid):
+              if not project.isdigit() or project.startswith("0"):
+                  die("invalid project")
+              if len(tag) < 6 or not tag.startswith("v"):
+                  die("invalid tag")
+              parts = tag[1:].split(".")
+              if len(parts) != 3 or any((not part.isdigit()) or (len(part) > 1 and part.startswith("0")) for part in parts):
+                  die("invalid tag")
+              if len(sha) != 40 or any(ch not in "0123456789abcdef" for ch in sha):
+                  die("invalid sha")
+              prefix = "b-%s-%s-" % (tag[1:], sha[:12])
+              if not rid.startswith(prefix) or len(rid) != len(prefix) + 16:
+                  die("invalid rid")
+              stamp = rid[len(prefix):]
+              if not (stamp[:8].isdigit() and stamp[8] == "T" and stamp[9:15].isdigit() and stamp[15] == "Z"):
+                  die("invalid rid")
+
+
+          class NoRedirect(urllib.request.HTTPRedirectHandler):
+              def redirect_request(self, req, fp, code, msg, headers, newurl):
+                  return None
+
+
+          def api_url(api, suffix):
+              base = api.strip()
+              if "://" not in base:
+                  die("invalid source api")
+              rest = base.split("://", 1)[1]
+              if "@" in rest or "?" in base or "#" in base:
+                  die("invalid source api")
+              return base.rstrip("/") + suffix
+
+
+          def read_token_url(url, token, accept):
+              original = urllib.parse.urlsplit(url)
+              current = url
+              send_token = True
+              for _attempt in range(5):
+                  headers = {
+                      "Accept": accept,
+                      "User-Agent": "bundle-depot-bootstrap",
+                  }
+                  if send_token:
+                      headers["PRIVATE-TOKEN"] = token
+                  request = urllib.request.Request(current, headers=headers, method="GET")
+                  opener = urllib.request.build_opener(NoRedirect)
+                  try:
+                      with opener.open(request, timeout=180) as response:
+                          return response.read()
+                  except urllib.error.HTTPError as error:
+                      if error.code in (301, 302, 303, 307, 308):
+                          location = error.headers.get("Location") or ""
+                          if not location:
+                              die("source redirect missing location")
+                          new_url = urllib.parse.urljoin(current, location)
+                          parsed = urllib.parse.urlsplit(new_url)
+                          if parsed.scheme not in ("http", "https"):
+                              die("source redirect scheme rejected")
+                          send_token = parsed.hostname == original.hostname
+                          current = new_url
+                          continue
+                      die("source request failed with status %s" % error.code)
+                  except urllib.error.URLError:
+                      die("source request failed")
+              die("source redirect limit exceeded")
+
+
+          def verify_tag(api, project, tag, expected, token):
+              quoted = urllib.parse.quote(tag, safe="")
+              url = api_url(api, "/projects/%s/repository/tags/%s" % (project, quoted))
+              payload = read_token_url(url, token, "application/json")
+              try:
+                  body = json.loads(payload.decode("utf-8"))
+              except (UnicodeError, json.JSONDecodeError):
+                  die("tag lookup response was not JSON")
+              if not isinstance(body, dict):
+                  die("tag lookup response was not an object")
+              actual = body["commit"]["id"]
+              if not isinstance(actual, str):
+                  die("tag lookup returned invalid sha")
+              if actual != expected:
+                  die("tag SHA does not match requested SHA")
+              return actual
+
+
+          def download_archive(api, project, sha, token):
+              url = api_url(api, "/projects/%s/repository/archive?sha=%s" % (project, sha))
+              return read_token_url(url, token, "application/octet-stream")
+
+
+          validate_identity(os.environ["PROJECT"], os.environ["TAG"], os.environ["SHA"], os.environ["RID"])
+          verify_tag(os.environ["SOURCE_GIT_API"], os.environ["PROJECT"], os.environ["TAG"], os.environ["SHA"], os.environ["SOURCE_GIT_TOKEN"])
+          PY
   build:
     needs: validate
     strategy:
@@ -71,61 +254,277 @@ jobs:
           - target: macos-arm64
             os: macos-14
     runs-on: ${{ matrix.os }}
-    permissions: {}
+    permissions:
+      actions: write
     defaults:
       run:
         shell: bash
     steps:
-      - name: checkout-executor
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
-        with:
-          sparse-checkout: .github/bin
-          sparse-checkout-cone-mode: false
-      - name: verify-tag
-        env:
-          SOURCE_GIT_TOKEN: ${{ secrets.SOURCE_GIT_TOKEN }}
-          SOURCE_GIT_API: ${{ secrets.SOURCE_GIT_API }}
-          SOURCE_GIT_PROJECT: ${{ needs.validate.outputs.project }}
-          TAG: ${{ needs.validate.outputs.tag }}
-          SHA: ${{ needs.validate.outputs.sha }}
-          TARGET: ${{ matrix.target }}
-        run: |
-          set -euo pipefail
-          EXEC="$GITHUB_WORKSPACE/.github/bin/bundle-tool-$TARGET"
-          case "$TARGET" in
-            windows-*) EXEC="$EXEC.exe" ;;
-            *) EXEC="$EXEC.bin" ;;
-          esac
-          chmod +x "$EXEC"
-          "$EXEC" verify-tag
       - name: fetch-source
         env:
           SOURCE_GIT_TOKEN: ${{ secrets.SOURCE_GIT_TOKEN }}
           SOURCE_GIT_API: ${{ secrets.SOURCE_GIT_API }}
-          SOURCE_GIT_PROJECT: ${{ needs.validate.outputs.project }}
+          PROJECT: ${{ needs.validate.outputs.project }}
+          TAG: ${{ needs.validate.outputs.tag }}
           SHA: ${{ needs.validate.outputs.sha }}
-          TARGET: ${{ matrix.target }}
+          RID: ${{ needs.validate.outputs.rid }}
         run: |
           set -euo pipefail
-          EXEC="$GITHUB_WORKSPACE/.github/bin/bundle-tool-$TARGET"
-          case "$TARGET" in
-            windows-*) EXEC="$EXEC.exe" ;;
-            *) EXEC="$EXEC.bin" ;;
-          esac
-          chmod +x "$EXEC"
-          "$EXEC" fetch-source --output "$GITHUB_WORKSPACE/src"
-      - name: assert-files
-        env:
-          TARGET: ${{ matrix.target }}
+          if command -v python3 >/dev/null 2>&1; then
+            PYBIN=python3
+          elif command -v python >/dev/null 2>&1; then
+            PYBIN=python
+          else
+            exit 1
+          fi
+          "$PYBIN" - <<'PY'
+          """Safe Gongfeng archive extraction for the phase 1 bootstrap."""
+
+          import os
+          import shutil
+          import stat
+          import tempfile
+          import zipfile
+
+
+          class ArchiveError(Exception):
+              pass
+
+
+          def validate_entry_name(name):
+              if not name or "\x00" in name:
+                  raise ArchiveError("archive contains unsafe entry names")
+              normalized = name.replace("\\", "/")
+              if normalized.startswith("/") or normalized.startswith("\\"):
+                  raise ArchiveError("archive contains unsafe entry names")
+              if len(normalized) >= 2 and normalized[0].isalpha() and normalized[1] == ":":
+                  raise ArchiveError("archive contains unsafe entry names")
+              parts = []
+              for part in normalized.split("/"):
+                  if part in ("", "."):
+                      continue
+                  if part == "..":
+                      raise ArchiveError("archive contains unsafe entry names")
+                  parts.append(part)
+              if not parts:
+                  raise ArchiveError("archive contains unsafe entry names")
+              return parts
+
+
+          def is_symlink(info):
+              mode = info.external_attr >> 16
+              return stat.S_ISLNK(mode)
+
+
+          def inspect_archive(blob):
+              try:
+                  archive = zipfile.ZipFile(__import__("io").BytesIO(blob))
+              except zipfile.BadZipFile as exc:
+                  raise ArchiveError("archive contains no files") from exc
+              files = []
+              seen = set()
+              for info in archive.infolist():
+                  raw = info.filename.replace("\\", "/")
+                  if raw.endswith("/"):
+                      validate_entry_name(raw[:-1])
+                      continue
+                  if is_symlink(info):
+                      raise ArchiveError("archive contains unsafe entry names")
+                  parts = validate_entry_name(raw)
+                  key = "/".join(parts)
+                  if key in seen:
+                      raise ArchiveError("archive contains unsafe entry names")
+                  seen.add(key)
+                  files.append((info, parts))
+              if not files:
+                  raise ArchiveError("archive contains no files")
+              prefixes = set()
+              for _info, parts in files:
+                  prefixes.add(parts[0] if len(parts) > 1 else "")
+              if len(prefixes) == 1:
+                  prefix = next(iter(prefixes))
+                  if prefix:
+                      stripped = []
+                      for info, parts in files:
+                          relative = parts[1:]
+                          if not relative:
+                              raise ArchiveError("archive contains unsafe entry names")
+                          stripped.append((info, relative))
+                      files = stripped
+              return archive, files
+
+
+          def extract_archive(blob, output):
+              if len(blob) < 1000:
+                  raise ArchiveError("archive is too small")
+              output = os.path.abspath(output)
+              if os.path.lexists(output):
+                  raise ArchiveError("output directory already exists")
+              parent = os.path.dirname(output)
+              if not os.path.isdir(parent):
+                  raise ArchiveError("output parent directory does not exist")
+              archive, files = inspect_archive(blob)
+              staging = tempfile.mkdtemp(prefix="src-stage-", dir=parent)
+              try:
+                  for info, parts in files:
+                      dest = os.path.join(staging, *parts)
+                      if os.path.commonpath([staging, os.path.abspath(dest)]) != staging:
+                          raise ArchiveError("archive contains unsafe entry names")
+                      os.makedirs(os.path.dirname(dest), exist_ok=True)
+                      with archive.open(info, "r") as source, open(dest, "wb") as target:
+                          shutil.copyfileobj(source, target)
+                  os.rename(staging, output)
+              except Exception:
+                  shutil.rmtree(staging, ignore_errors=True)
+                  raise
+              return len(files)
+
+          """Token-authenticated Gongfeng tag and archive reads. No Release writes."""
+
+          import json
+          import os
+          import sys
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+
+
+          def die(message):
+              text = str(message)
+              secret = os.environ.get("SOURCE_GIT_TOKEN") or ""
+              if secret:
+                  text = text.replace(secret, "[redacted]")
+              sys.stderr.write(text + chr(10))
+              raise SystemExit(1)
+
+
+          def validate_identity(project, tag, sha, rid):
+              if not project.isdigit() or project.startswith("0"):
+                  die("invalid project")
+              if len(tag) < 6 or not tag.startswith("v"):
+                  die("invalid tag")
+              parts = tag[1:].split(".")
+              if len(parts) != 3 or any((not part.isdigit()) or (len(part) > 1 and part.startswith("0")) for part in parts):
+                  die("invalid tag")
+              if len(sha) != 40 or any(ch not in "0123456789abcdef" for ch in sha):
+                  die("invalid sha")
+              prefix = "b-%s-%s-" % (tag[1:], sha[:12])
+              if not rid.startswith(prefix) or len(rid) != len(prefix) + 16:
+                  die("invalid rid")
+              stamp = rid[len(prefix):]
+              if not (stamp[:8].isdigit() and stamp[8] == "T" and stamp[9:15].isdigit() and stamp[15] == "Z"):
+                  die("invalid rid")
+
+
+          class NoRedirect(urllib.request.HTTPRedirectHandler):
+              def redirect_request(self, req, fp, code, msg, headers, newurl):
+                  return None
+
+
+          def api_url(api, suffix):
+              base = api.strip()
+              if "://" not in base:
+                  die("invalid source api")
+              rest = base.split("://", 1)[1]
+              if "@" in rest or "?" in base or "#" in base:
+                  die("invalid source api")
+              return base.rstrip("/") + suffix
+
+
+          def read_token_url(url, token, accept):
+              original = urllib.parse.urlsplit(url)
+              current = url
+              send_token = True
+              for _attempt in range(5):
+                  headers = {
+                      "Accept": accept,
+                      "User-Agent": "bundle-depot-bootstrap",
+                  }
+                  if send_token:
+                      headers["PRIVATE-TOKEN"] = token
+                  request = urllib.request.Request(current, headers=headers, method="GET")
+                  opener = urllib.request.build_opener(NoRedirect)
+                  try:
+                      with opener.open(request, timeout=180) as response:
+                          return response.read()
+                  except urllib.error.HTTPError as error:
+                      if error.code in (301, 302, 303, 307, 308):
+                          location = error.headers.get("Location") or ""
+                          if not location:
+                              die("source redirect missing location")
+                          new_url = urllib.parse.urljoin(current, location)
+                          parsed = urllib.parse.urlsplit(new_url)
+                          if parsed.scheme not in ("http", "https"):
+                              die("source redirect scheme rejected")
+                          send_token = parsed.hostname == original.hostname
+                          current = new_url
+                          continue
+                      die("source request failed with status %s" % error.code)
+                  except urllib.error.URLError:
+                      die("source request failed")
+              die("source redirect limit exceeded")
+
+
+          def verify_tag(api, project, tag, expected, token):
+              quoted = urllib.parse.quote(tag, safe="")
+              url = api_url(api, "/projects/%s/repository/tags/%s" % (project, quoted))
+              payload = read_token_url(url, token, "application/json")
+              try:
+                  body = json.loads(payload.decode("utf-8"))
+              except (UnicodeError, json.JSONDecodeError):
+                  die("tag lookup response was not JSON")
+              if not isinstance(body, dict):
+                  die("tag lookup response was not an object")
+              actual = body["commit"]["id"]
+              if not isinstance(actual, str):
+                  die("tag lookup returned invalid sha")
+              if actual != expected:
+                  die("tag SHA does not match requested SHA")
+              return actual
+
+
+          def download_archive(api, project, sha, token):
+              url = api_url(api, "/projects/%s/repository/archive?sha=%s" % (project, sha))
+              return read_token_url(url, token, "application/octet-stream")
+
+
+          def main():
+              project = os.environ["PROJECT"]
+              tag = os.environ["TAG"]
+              sha = os.environ["SHA"]
+              rid = os.environ["RID"]
+              api = os.environ["SOURCE_GIT_API"]
+              token = os.environ["SOURCE_GIT_TOKEN"]
+              output = os.path.join(os.environ["GITHUB_WORKSPACE"], "src")
+              validate_identity(project, tag, sha, rid)
+              if project != "398245":
+                  die("bootstrap project mismatch")
+              verify_tag(api, project, tag, sha, token)
+              blob = download_archive(api, project, sha, token)
+              try:
+                  count = extract_archive(blob, output)
+              except ArchiveError as exc:
+                  die(exc)
+              sys.stderr.write("extracted %s files%s" % (count, chr(10)))
+
+          main()
+          PY
+      - name: install-and-build
         run: |
           set -euo pipefail
-          EXEC="$GITHUB_WORKSPACE/.github/bin/bundle-tool-$TARGET"
-          case "$TARGET" in
-            windows-*) EXEC="$EXEC.exe" ;;
-            *) EXEC="$EXEC.bin" ;;
-          esac
-          chmod +x "$EXEC"
-          "$EXEC" assert-files --root src --files Cargo.toml,rust-toolchain.toml,release.toml,release.py,docs/usage.md,src/main.rs
+          rustup toolchain install 1.98.1 --profile minimal
+          rustup component add rustfmt clippy --toolchain 1.98.1
+          if command -v getconf >/dev/null 2>&1; then
+            NPROC=$(getconf _NPROCESSORS_ONLN)
+          else
+            NPROC=2
+          fi
+          JOBS=$(( NPROC * 3 / 4 ))
+          if [ "$JOBS" -lt 1 ]; then
+            JOBS=1
+          fi
+          cd "$GITHUB_WORKSPACE/src"
+          CARGO_BUILD_JOBS="$JOBS" cargo build --release --locked --jobs "$JOBS"
       - name: run-plugin
         env:
           TAG: ${{ needs.validate.outputs.tag }}
@@ -134,13 +533,15 @@ jobs:
           TARGET: ${{ matrix.target }}
         run: |
           set -euo pipefail
-          EXEC="$GITHUB_WORKSPACE/.github/bin/bundle-tool-$TARGET"
           case "$TARGET" in
-            windows-*) EXEC="$EXEC.exe" ;;
-            *) EXEC="$EXEC.bin" ;;
+            windows-*) EXEC="$GITHUB_WORKSPACE/src/target/release/bundle-tool.exe" ;;
+            *) EXEC="$GITHUB_WORKSPACE/src/target/release/bundle-tool" ;;
           esac
+          test -f "$EXEC"
           chmod +x "$EXEC"
-          cd src
+          cd "$GITHUB_WORKSPACE/src"
+          unset SOURCE_GIT_TOKEN || true
+          unset SOURCE_GIT_API || true
           "$EXEC" run --source . --output "$RUNNER_TEMP/pkg-$TARGET" --tag "$TAG" --sha "$SHA" --rid "$RID" --platform "$TARGET"
       - name: upload-pkg
         uses: actions/upload-artifact@50769540e7f4bd5e21e526ee35c689e35e0d6874
@@ -149,17 +550,24 @@ jobs:
           path: ${{ runner.temp }}/pkg-${{ matrix.target }}
           retention-days: 1
           if-no-files-found: error
-
-  prepare-bundle:
+      - name: upload-linux-executor
+        if: matrix.target == 'linux-x64'
+        uses: actions/upload-artifact@50769540e7f4bd5e21e526ee35c689e35e0d6874
+        with:
+          name: bundle-tool-linux
+          path: src/target/release/bundle-tool
+          retention-days: 1
+          if-no-files-found: error
+  handoff:
     needs: [validate, build]
     runs-on: ubuntu-22.04
-    permissions: {}
+    permissions:
+      actions: read
+      contents: write
+    defaults:
+      run:
+        shell: bash
     steps:
-      - name: checkout-executor
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
-        with:
-          sparse-checkout: .github/bin
-          sparse-checkout-cone-mode: false
       - name: fetch-pkg-linux
         uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16
         with:
@@ -180,17 +588,11 @@ jobs:
         with:
           name: pkg-macos-arm64
           path: packages/pkg-macos-arm64
-      - name: verify-tag
-        env:
-          SOURCE_GIT_TOKEN: ${{ secrets.SOURCE_GIT_TOKEN }}
-          SOURCE_GIT_API: ${{ secrets.SOURCE_GIT_API }}
-          SOURCE_GIT_PROJECT: ${{ needs.validate.outputs.project }}
-          TAG: ${{ needs.validate.outputs.tag }}
-          SHA: ${{ needs.validate.outputs.sha }}
-        run: |
-          set -euo pipefail
-          chmod +x .github/bin/bundle-tool-linux-x64.bin
-          .github/bin/bundle-tool-linux-x64.bin verify-tag
+      - name: fetch-linux-executor
+        uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16
+        with:
+          name: bundle-tool-linux
+          path: executor
       - name: assemble
         env:
           TAG: ${{ needs.validate.outputs.tag }}
@@ -198,24 +600,339 @@ jobs:
           RID: ${{ needs.validate.outputs.rid }}
         run: |
           set -euo pipefail
-          chmod +x .github/bin/bundle-tool-linux-x64.bin
-          .github/bin/bundle-tool-linux-x64.bin assemble --input packages --output "$GITHUB_WORKSPACE/release-bundle" --tag "$TAG" --sha "$SHA" --rid "$RID"
-      - name: upload-bundle
-        uses: actions/upload-artifact@50769540e7f4bd5e21e526ee35c689e35e0d6874
-        with:
-          name: release-bundle
-          path: release-bundle/
-          retention-days: 1
-          if-no-files-found: error
+          EXEC="$GITHUB_WORKSPACE/executor/bundle-tool"
+          test -f "$EXEC"
+          chmod +x "$EXEC"
+          unset SOURCE_GIT_TOKEN || true
+          unset SOURCE_GIT_API || true
+          unset GITHUB_TOKEN || true
+          "$EXEC" assemble --input "$GITHUB_WORKSPACE/packages" --output "$GITHUB_WORKSPACE/release-bundle" --tag "$TAG" --sha "$SHA" --rid "$RID"
+      - name: encrypt-handoff
+        env:
+          SOURCE_GIT_TOKEN: ${{ secrets.SOURCE_GIT_TOKEN }}
+          SOURCE_GIT_PROJECT: ${{ needs.validate.outputs.project }}
+          TAG: ${{ needs.validate.outputs.tag }}
+          SHA: ${{ needs.validate.outputs.sha }}
+          RID: ${{ needs.validate.outputs.rid }}
+        run: |
+          set -euo pipefail
+          EXEC="$GITHUB_WORKSPACE/executor/bundle-tool"
+          test -f "$EXEC"
+          chmod +x "$EXEC"
+          unset GITHUB_TOKEN || true
+          "$EXEC" handoff --bundle "$GITHUB_WORKSPACE/release-bundle" --output "$RUNNER_TEMP/release-bundle.zip" > "$RUNNER_TEMP/handoff-summary.txt"
+      - name: publish-prerelease
+        env:
+          PROJECT: ${{ needs.validate.outputs.project }}
+          TAG: ${{ needs.validate.outputs.tag }}
+          SHA: ${{ needs.validate.outputs.sha }}
+          RID: ${{ needs.validate.outputs.rid }}
+          GITHUB_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          ZIP: ${{ runner.temp }}/release-bundle.zip
+        run: |
+          set -euo pipefail
+          if command -v python3 >/dev/null 2>&1; then
+            PYBIN=python3
+          elif command -v python >/dev/null 2>&1; then
+            PYBIN=python
+          else
+            exit 1
+          fi
+          "$PYBIN" - <<'PY'
+          """GitHub handoff prerelease publisher. No Gongfeng writes and no direct asset fallback."""
 
-  publish:
-    needs: [validate, prepare-bundle]
-    uses: ./.github/workflows/publish.yml
-    with:
-      project: ${{ needs.validate.outputs.project }}
-      tag: ${{ needs.validate.outputs.tag }}
-      sha: ${{ needs.validate.outputs.sha }}
-      rid: ${{ needs.validate.outputs.rid }}
-    secrets:
-      api: ${{ secrets.SOURCE_GIT_API }}
-      token: ${{ secrets.SOURCE_GIT_TOKEN }}
+          import hashlib
+          import json
+          import os
+          import sys
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+
+          CANONICAL_TEMPLATE = '{"schema":"bundle-depot-handoff.v1","project":"%s","tag":"%s","sha":"%s","rid":"%s","asset":"release-bundle.zip","size":%d,"sha256":"%s"}'
+          API_ROOT = "https://api.github.com"
+          UPLOAD_ROOT = "https://uploads.github.com"
+
+
+          def die(message):
+              text = str(message)
+              for name in ("GITHUB_TOKEN", "SOURCE_GIT_TOKEN"):
+                  secret = os.environ.get(name) or ""
+                  if secret:
+                      text = text.replace(secret, "[redacted]")
+              sys.stderr.write(text + "\n")
+              raise SystemExit(1)
+
+
+          def emit(tag, url, size, sha256, conclusion):
+              sys.stdout.write(
+                  "handoff_tag=%s\nasset_url=%s\nsize=%s\nsha256=%s\nconclusion=%s\n"
+                  % (tag, url, size, sha256, conclusion)
+              )
+
+
+          def validate_identity(project, tag, sha, rid):
+              if not project.isdigit() or project.startswith("0"):
+                  die("invalid project")
+              if len(tag) < 6 or not tag.startswith("v"):
+                  die("invalid tag")
+              parts = tag[1:].split(".")
+              if len(parts) != 3 or any(
+                  (not part.isdigit()) or (len(part) > 1 and part.startswith("0")) for part in parts
+              ):
+                  die("invalid tag")
+              if len(sha) != 40 or any(ch not in "0123456789abcdef" for ch in sha):
+                  die("invalid sha")
+              prefix = "b-%s-%s-" % (tag[1:], sha[:12])
+              if not rid.startswith(prefix) or len(rid) != len(prefix) + 16:
+                  die("invalid rid")
+              stamp = rid[len(prefix):]
+              if not (
+                  stamp[:8].isdigit()
+                  and stamp[8] == "T"
+                  and stamp[9:15].isdigit()
+                  and stamp[15] == "Z"
+              ):
+                  die("invalid rid")
+
+
+          def canonical_body(project, tag, sha, rid, size, sha256):
+              if not isinstance(size, int) or isinstance(size, bool) or size <= 0:
+                  die("invalid size")
+              if len(sha256) != 64 or any(ch not in "0123456789abcdef" for ch in sha256):
+                  die("invalid sha256")
+              return CANONICAL_TEMPLATE % (project, tag, sha, rid, size, sha256)
+
+
+          def handoff_tag(project, rid):
+              return "handoff-p%s-%s" % (project, rid)
+
+
+          def file_digest(path):
+              digest = hashlib.sha256()
+              with open(path, "rb") as handle:
+                  for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                      digest.update(chunk)
+              size = digest.copy()  # keep hash object; size comes from the file
+              return os.path.getsize(path), digest.hexdigest()
+
+
+          class NoRedirect(urllib.request.HTTPRedirectHandler):
+              def redirect_request(self, req, fp, code, msg, headers, newurl):
+                  return None
+
+
+          class HttpClient:
+              def request(self, method, url, token, data=None, accept="application/vnd.github+json"):
+                  headers = {
+                      "Authorization": "Bearer " + token,
+                      "Accept": accept,
+                      "User-Agent": "bundle-depot-handoff",
+                      "X-GitHub-Api-Version": "2022-11-28",
+                  }
+                  body = None
+                  if data is not None:
+                      if isinstance(data, bytes):
+                          body = data
+                          headers["Content-Type"] = "application/octet-stream"
+                      else:
+                          body = json.dumps(data).encode("utf-8")
+                          headers["Content-Type"] = "application/json"
+                  opener = urllib.request.build_opener(NoRedirect)
+                  request = urllib.request.Request(url, data=body, headers=headers, method=method)
+                  try:
+                      with opener.open(request, timeout=120) as response:
+                          return response.status, dict(response.headers), response.read()
+                  except urllib.error.HTTPError as error:
+                      return error.code, dict(error.headers), error.read()
+
+
+          def read_asset_bytes(client, repo, asset_id, token):
+              url = API_ROOT + "/repos/%s/releases/assets/%s" % (repo, asset_id)
+              status, headers, payload = client.request(
+                  "GET", url, token, accept="application/octet-stream"
+              )
+              if status == 200 and payload:
+                  return payload
+              if status in (301, 302, 303, 307, 308):
+                  location = headers.get("Location") or headers.get("location") or ""
+                  if not location.startswith("https://"):
+                      die("asset read redirect missing")
+                  request = urllib.request.Request(
+                      location,
+                      headers={"User-Agent": "bundle-depot-handoff", "Accept": "application/octet-stream"},
+                      method="GET",
+                  )
+                  with urllib.request.urlopen(request, timeout=120) as response:
+                      return response.read()
+              die("asset read failed with status %s" % status)
+
+
+          def json_body(payload, label):
+              try:
+                  value = json.loads(payload.decode("utf-8"))
+              except (UnicodeError, json.JSONDecodeError):
+                  die("%s response was not JSON" % label)
+              if not isinstance(value, dict):
+                  die("%s response was not an object" % label)
+              return value
+
+
+          def get_release_by_tag(client, repo, tag, token):
+              quoted = urllib.parse.quote(tag, safe="")
+              url = API_ROOT + "/repos/%s/releases/tags/%s" % (repo, quoted)
+              status, _headers, payload = client.request("GET", url, token)
+              if status == 404:
+                  return None
+              if status != 200:
+                  die("release lookup failed with status %s" % status)
+              return json_body(payload, "release lookup")
+
+
+          def classify_existing(release, expected, asset_bytes):
+              if release.get("draft") is True:
+                  return "existing draft must not be overwritten"
+              expected_tag = expected["handoff_tag"]
+              if release.get("tag_name") != expected_tag or release.get("name") != expected_tag:
+                  return "existing release identity mismatch"
+              if release.get("prerelease") is not True:
+                  return "existing release identity mismatch"
+              if release.get("body") != expected["body"]:
+                  return "existing release body mismatch"
+              assets = release.get("assets") or []
+              if len(assets) > 1:
+                  return "existing release has an extra asset"
+              if len(assets) != 1:
+                  return "existing release asset mismatch"
+              asset = assets[0]
+              if asset.get("name") != "release-bundle.zip" or asset.get("size") != expected["size"]:
+                  return "existing release asset mismatch"
+              if len(asset_bytes) != expected["size"] or hashlib.sha256(asset_bytes).hexdigest() != expected["sha256"]:
+                  return "existing release asset mismatch"
+              return None
+
+
+          def asset_url(repo, asset):
+              url = asset.get("url") or ""
+              if url.startswith(API_ROOT + "/"):
+                  return url
+              return API_ROOT + "/repos/%s/releases/assets/%s" % (repo, asset.get("id"))
+
+
+          def publish_handoff(client, repo, token, project, tag, sha, rid, zip_path):
+              validate_identity(project, tag, sha, rid)
+              size, sha256 = file_digest(zip_path)
+              body = canonical_body(project, tag, sha, rid, size, sha256)
+              expected_tag = handoff_tag(project, rid)
+              expected = {
+                  "handoff_tag": expected_tag,
+                  "body": body,
+                  "size": size,
+                  "sha256": sha256,
+              }
+              existing = get_release_by_tag(client, repo, expected_tag, token)
+              if existing is not None:
+                  assets = existing.get("assets") or []
+                  asset_bytes = b""
+                  if len(assets) == 1 and assets[0].get("id") is not None:
+                      asset_bytes = read_asset_bytes(client, repo, assets[0]["id"], token)
+                  reason = classify_existing(existing, expected, asset_bytes)
+                  if reason:
+                      die(reason)
+                  emit(expected_tag, asset_url(repo, assets[0]), size, sha256, "success")
+                  return
+              created = create_draft(client, repo, token, expected_tag, body)
+              uploaded = upload_asset(client, repo, token, created["id"], zip_path)
+              verify_release(client, repo, token, created["id"], expected, uploaded["id"])
+              patched = patch_prerelease(client, repo, token, created["id"])
+              final = verify_release(client, repo, token, patched["id"], expected, uploaded["id"])
+              if final.get("draft") is not False or final.get("prerelease") is not True:
+                  die("final release is not a strict prerelease")
+              emit(expected_tag, asset_url(repo, final["assets"][0]), size, sha256, "success")
+
+
+          def create_draft(client, repo, token, tag, body):
+              status, _headers, payload = client.request(
+                  "POST",
+                  API_ROOT + "/repos/%s/releases" % repo,
+                  token,
+                  data={
+                      "tag_name": tag,
+                      "name": tag,
+                      "body": body,
+                      "draft": True,
+                      "prerelease": False,
+                      "generate_release_notes": False,
+                  },
+              )
+              if status not in (200, 201):
+                  die("draft create failed with status %s" % status)
+              return json_body(payload, "draft create")
+
+
+          def upload_asset(client, repo, token, release_id, zip_path):
+              with open(zip_path, "rb") as handle:
+                  blob = handle.read()
+              url = (
+                  UPLOAD_ROOT
+                  + "/repos/%s/releases/%s/assets?name=release-bundle.zip" % (repo, release_id)
+              )
+              status, _headers, payload = client.request("POST", url, token, data=blob)
+              if status not in (200, 201):
+                  die("asset upload failed with status %s" % status)
+              return json_body(payload, "asset upload")
+
+
+          def patch_prerelease(client, repo, token, release_id):
+              status, _headers, payload = client.request(
+                  "PATCH",
+                  API_ROOT + "/repos/%s/releases/%s" % (repo, release_id),
+                  token,
+                  data={"draft": False, "prerelease": True},
+              )
+              if status != 200:
+                  die("prerelease update failed with status %s" % status)
+              return json_body(payload, "prerelease update")
+
+
+          def verify_release(client, repo, token, release_id, expected, asset_id):
+              status, _headers, payload = client.request(
+                  "GET",
+                  API_ROOT + "/repos/%s/releases/%s" % (repo, release_id),
+                  token,
+              )
+              if status != 200:
+                  die("release reread failed with status %s" % status)
+              release = json_body(payload, "release reread")
+              if release.get("tag_name") != expected["handoff_tag"] or release.get("name") != expected["handoff_tag"]:
+                  die("existing release identity mismatch")
+              if release.get("body") != expected["body"]:
+                  die("existing release body mismatch")
+              assets = release.get("assets") or []
+              if len(assets) > 1:
+                  die("existing release has an extra asset")
+              if len(assets) != 1 or assets[0].get("name") != "release-bundle.zip" or assets[0].get("id") != asset_id:
+                  die("existing release asset mismatch")
+              if assets[0].get("size") != expected["size"]:
+                  die("existing release asset mismatch")
+              blob = read_asset_bytes(client, repo, asset_id, token)
+              if len(blob) != expected["size"] or hashlib.sha256(blob).hexdigest() != expected["sha256"]:
+                  die("existing release asset mismatch")
+              return release
+
+
+          def main():
+              project = os.environ["PROJECT"]
+              tag = os.environ["TAG"]
+              sha = os.environ["SHA"]
+              rid = os.environ["RID"]
+              repo = os.environ["GITHUB_REPOSITORY"]
+              token = os.environ["GITHUB_TOKEN"]
+              zip_path = os.environ.get("ZIP", "release-bundle.zip")
+              publish_handoff(HttpClient(), repo, token, project, tag, sha, rid, zip_path)
+
+
+          if __name__ == "__main__":
+              main()
+          PY

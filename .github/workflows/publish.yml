@@ -2,61 +2,15 @@ name: publish
 
 on:
   workflow_call:
-    inputs:
-      project:
-        required: true
-        type: string
-      tag:
-        required: true
-        type: string
-      sha:
-        required: true
-        type: string
-      rid:
-        required: true
-        type: string
-    secrets:
-      api:
-        required: true
-      token:
-        required: true
 
 permissions: {}
 
 jobs:
-  publish:
+  retired:
     runs-on: ubuntu-22.04
     permissions: {}
     steps:
-      - name: validate-project
-        env:
-          PROJECT: ${{ inputs.project }}
+      - name: retired-interface
         run: |
-          set -euo pipefail
-          if [[ ! "$PROJECT" =~ ^[1-9][0-9]*$ ]]; then
-            printf 'invalid project input\n' >&2
-            exit 1
-          fi
-      - name: download
-        uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16
-        with:
-          name: release-bundle
-          path: bundle/
-      - name: checkout-executor
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
-        with:
-          path: executor
-          sparse-checkout: .github/bin
-          sparse-checkout-cone-mode: false
-      - name: publish-release
-        env:
-          SOURCE_GIT_API: ${{ secrets.api }}
-          SOURCE_GIT_PROJECT: ${{ inputs.project }}
-          SOURCE_GIT_TOKEN: ${{ secrets.token }}
-          TAG: ${{ inputs.tag }}
-          SHA: ${{ inputs.sha }}
-          RID: ${{ inputs.rid }}
-        run: |
-          set -euo pipefail
-          chmod +x executor/.github/bin/bundle-tool-linux-x64.bin
-          executor/.github/bin/bundle-tool-linux-x64.bin publish --bundle bundle
+          printf 'publish interface retired' >&2
+          exit 1
