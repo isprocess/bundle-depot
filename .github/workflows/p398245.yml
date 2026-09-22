@@ -534,10 +534,16 @@ jobs:
         run: |
           set -euo pipefail
           case "$TARGET" in
-            windows-*) EXEC="$GITHUB_WORKSPACE/src/target/release/bundle-tool.exe" ;;
-            *) EXEC="$GITHUB_WORKSPACE/src/target/release/bundle-tool" ;;
+            windows-*) BUILT="$GITHUB_WORKSPACE/src/target/release/bundle-tool.exe" ;;
+            *) BUILT="$GITHUB_WORKSPACE/src/target/release/bundle-tool" ;;
           esac
-          test -f "$EXEC"
+          test -f "$BUILT"
+          mkdir -p "$RUNNER_TEMP/runner"
+          case "$TARGET" in
+            windows-*) EXEC="$RUNNER_TEMP/runner/bundle-tool.exe" ;;
+            *) EXEC="$RUNNER_TEMP/runner/bundle-tool" ;;
+          esac
+          cp "$BUILT" "$EXEC"
           chmod +x "$EXEC"
           cd "$GITHUB_WORKSPACE/src"
           unset SOURCE_GIT_TOKEN || true
