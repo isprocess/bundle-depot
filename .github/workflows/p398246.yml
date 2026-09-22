@@ -1,5 +1,7 @@
 name: p398246
 
+run-name: "${{ github.event.client_payload.rid }}"
+
 on:
   repository_dispatch:
     types: [build_398246]
@@ -208,14 +210,16 @@ jobs:
           retention-days: 1
           if-no-files-found: error
 
-  publish:
+  handoff:
     needs: [validate, prepare-bundle]
-    uses: ./.github/workflows/publish.yml
+    permissions:
+      actions: read
+      contents: write
+    uses: ./.github/workflows/handoff.yml
     with:
-      project: ${{ needs.validate.outputs.project }}
-      tag: ${{ needs.validate.outputs.tag }}
-      sha: ${{ needs.validate.outputs.sha }}
-      rid: ${{ needs.validate.outputs.rid }}
+      project: "${{ needs.validate.outputs.project }}"
+      tag: "${{ needs.validate.outputs.tag }}"
+      sha: "${{ needs.validate.outputs.sha }}"
+      rid: "${{ needs.validate.outputs.rid }}"
     secrets:
-      api: ${{ secrets.SOURCE_GIT_API }}
-      token: ${{ secrets.SOURCE_GIT_TOKEN }}
+      token: "${{ secrets.SOURCE_GIT_TOKEN }}"
