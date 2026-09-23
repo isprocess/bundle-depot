@@ -45,7 +45,9 @@ jobs:
           import re
           import sys
           import time
+          import urllib.error
           import urllib.parse
+          import urllib.request
           from datetime import datetime, timedelta, timezone
 
           CANONICAL_TEMPLATE = '{"schema":"bundle-depot-handoff.v1","project":"%s","tag":"%s","sha":"%s","rid":"%s","asset":"release-bundle.zip","size":%d,"sha256":"%s"}'
