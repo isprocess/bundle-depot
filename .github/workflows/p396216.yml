@@ -149,6 +149,8 @@ jobs:
         shell: bash
     outputs:
       index_digest: ${{ steps.index.outputs.index_digest }}
+      amd64_digest: ${{ steps.index.outputs.amd64_digest }}
+      arm64_digest: ${{ steps.index.outputs.arm64_digest }}
     steps:
       - name: fetch-pkg-linux-x64
         uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16
@@ -201,10 +203,83 @@ jobs:
           push: true
           outputs: type=image,push-by-digest=true,name-canonical=true,name=isprocess/new-api
 
-      - name: verify-platform-digests
+      - name: index
+        id: index
         env:
+          TAG: ${{ needs.validate.outputs.tag }}
           AMD64_DIGEST: ${{ steps.digests.outputs.amd64_digest }}
           ARM64_DIGEST: ${{ steps.digests.outputs.arm64_digest }}
+        run: |
+          set -euo pipefail
+          image_tag="${TAG#v}"
+          ref="isprocess/new-api:${image_tag}"
+
+          present=no
+          for attempt in 1 2 3; do
+            if docker buildx imagetools inspect "$ref" >/dev/null 2>&1; then
+              present=yes
+              break
+            fi
+            sleep 3
+          done
+          if [ "$present" = no ]; then
+            printf 'version tag absent remotely, creating: %s\n' "$image_tag"
+            docker buildx imagetools create -t "$ref" "isprocess/new-api@${AMD64_DIGEST}" "isprocess/new-api@${ARM64_DIGEST}"
+          else
+            printf 'version tag present remotely, adopting existing index: %s\n' "$image_tag"
+          fi
+
+          manifest_json="$(docker buildx imagetools inspect "$ref" --format '{{json .Manifest}}')"
+          if [ -z "$manifest_json" ]; then
+            printf 'empty index manifest for %s\n' "$ref" >&2
+            exit 1
+          fi
+          MANIFEST_JSON="$manifest_json" python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import json, os, re, sys
+
+          index = json.loads(os.environ["MANIFEST_JSON"])
+          pattern = re.compile(r"^sha256:[0-9a-f]{64}$")
+          expected = {("linux", "amd64"), ("linux", "arm64")}
+          resolved = {}
+          for entry in index.get("manifests", []):
+              platform = entry.get("platform") or {}
+              key = (platform.get("os"), platform.get("architecture"))
+              annotation = (entry.get("annotations") or {}).get("vnd.docker.reference.type")
+              if annotation == "attestation-manifest":
+                  continue
+              if key not in expected:
+                  raise SystemExit(f"unexpected index entry: {key}")
+              digest = entry.get("digest")
+              if not isinstance(digest, str) or not pattern.fullmatch(digest):
+                  raise SystemExit(f"invalid digest for {key} in existing version index")
+              resolved[key] = digest
+          if set(resolved) != expected:
+              raise SystemExit(
+                  "existing version index does not contain exactly the linux/amd64 and linux/arm64 manifests; "
+                  "published version tags are never replaced - an operator must resolve this registry state"
+              )
+          amd64 = resolved[("linux", "amd64")]
+          arm64 = resolved[("linux", "arm64")]
+          print("amd64_digest=" + amd64)
+          print("arm64_digest=" + arm64)
+          print(f"resolved index platform digests: amd64={amd64} arm64={arm64}", file=sys.stderr)
+          PY
+
+          index_digest="$(docker buildx imagetools inspect "$ref" --format '{{json .Manifest.Digest}}' | tr -d '"')"
+          case "$index_digest" in
+            sha256:*) ;;
+            *) printf 'unexpected index digest: %s\n' "$index_digest" >&2; exit 1 ;;
+          esac
+          if [ "${#index_digest}" -ne 71 ]; then
+            printf 'unexpected index digest length: %s\n' "$index_digest" >&2
+            exit 1
+          fi
+          printf 'index_digest=%s\n' "$index_digest" >> "$GITHUB_OUTPUT"
+          printf 'index_digest=%s\n' "$index_digest"
+      - name: verify-platform-digests
+        env:
+          AMD64_DIGEST: ${{ steps.index.outputs.amd64_digest }}
+          ARM64_DIGEST: ${{ steps.index.outputs.arm64_digest }}
         run: |
           set -euo pipefail
           python3 - <<'PY'
@@ -223,78 +298,12 @@ jobs:
                   raise SystemExit(f"remote platform mismatch for {digest}")
               print(f"verified remote platform manifest {arch}: {digest}")
           PY
-      - name: index
-        id: index
-        env:
-          TAG: ${{ needs.validate.outputs.tag }}
-          AMD64_DIGEST: ${{ steps.digests.outputs.amd64_digest }}
-          ARM64_DIGEST: ${{ steps.digests.outputs.arm64_digest }}
-        run: |
-          set -euo pipefail
-          image_tag="${TAG#v}"
-          ref="isprocess/new-api:${image_tag}"
-
-          set +e
-          existing="$(docker buildx imagetools inspect "$ref" --format '{{json .Manifest.Digest}}' 2>/dev/null | tr -d '"')"
-          status=$?
-          set -e
-          if [ "$status" -ne 0 ] || [ -z "$existing" ]; then
-            printf 'version tag absent remotely, creating: %s\n' "$image_tag"
-            docker buildx imagetools create -t "$ref" "isprocess/new-api@${AMD64_DIGEST}" "isprocess/new-api@${ARM64_DIGEST}"
-          else
-            printf 'version tag present remotely: %s\n' "$image_tag"
-          fi
-
-          manifest_json="$(docker buildx imagetools inspect "$ref" --format '{{json .Manifest}}')"
-          if [ -z "$manifest_json" ]; then
-            printf 'empty index manifest for %s\n' "$ref" >&2
-            exit 1
-          fi
-          printf '%s' "$manifest_json" | AMD64_DIGEST="$AMD64_DIGEST" ARM64_DIGEST="$ARM64_DIGEST" python3 - <<'PY'
-          import json, os, sys
-          index = json.load(sys.stdin)
-          expected = {
-              ("linux", "amd64"): os.environ["AMD64_DIGEST"],
-              ("linux", "arm64"): os.environ["ARM64_DIGEST"],
-          }
-          seen = {}
-          for entry in index.get("manifests", []):
-              platform = entry.get("platform") or {}
-              key = (platform.get("os"), platform.get("architecture"))
-              annotation = (entry.get("annotations") or {}).get("vnd.docker.reference.type")
-              if annotation == "attestation-manifest":
-                  continue
-              if key not in expected:
-                  raise SystemExit(f"unexpected index entry: {key}")
-              if entry.get("digest") != expected[key]:
-                  raise SystemExit(
-                      f"version tag exists with a different {key[0]}/{key[1]} digest; published version tags are "
-                      "never replaced - an unpublished leftover from a failed run must be deleted from the registry "
-                      "before a re-run"
-                  )
-              seen[key] = entry.get("digest")
-          if set(seen) != set(expected):
-              raise SystemExit("index is missing a platform manifest")
-          print("index contains both verified platform digests")
-          PY
-
-          index_digest="$(docker buildx imagetools inspect "$ref" --format '{{json .Manifest.Digest}}' | tr -d '"')"
-          case "$index_digest" in
-            sha256:*) ;;
-            *) printf 'unexpected index digest: %s\n' "$index_digest" >&2; exit 1 ;;
-          esac
-          if [ "${#index_digest}" -ne 71 ]; then
-            printf 'unexpected index digest length: %s\n' "$index_digest" >&2
-            exit 1
-          fi
-          printf 'index_digest=%s\n' "$index_digest" >> "$GITHUB_OUTPUT"
-          printf 'index_digest=%s\n' "$index_digest"
       - name: install-cosign
         uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6
       - name: sign
         env:
-          AMD64_DIGEST: ${{ steps.digests.outputs.amd64_digest }}
-          ARM64_DIGEST: ${{ steps.digests.outputs.arm64_digest }}
+          AMD64_DIGEST: ${{ steps.index.outputs.amd64_digest }}
+          ARM64_DIGEST: ${{ steps.index.outputs.arm64_digest }}
           INDEX_DIGEST: ${{ steps.index.outputs.index_digest }}
         run: |
           set -euo pipefail
@@ -304,8 +313,8 @@ jobs:
       - name: latest
         env:
           TAG: ${{ needs.validate.outputs.tag }}
-          AMD64_DIGEST: ${{ steps.digests.outputs.amd64_digest }}
-          ARM64_DIGEST: ${{ steps.digests.outputs.arm64_digest }}
+          AMD64_DIGEST: ${{ steps.index.outputs.amd64_digest }}
+          ARM64_DIGEST: ${{ steps.index.outputs.arm64_digest }}
           INDEX_DIGEST: ${{ steps.index.outputs.index_digest }}
         run: |
           set -euo pipefail
@@ -391,6 +400,33 @@ jobs:
         with:
           name: pkg-linux-arm64
           path: packages/pkg-linux-arm64
+      - name: align-pkg-digests
+        env:
+          AMD64_DIGEST: ${{ needs.push.outputs.amd64_digest }}
+          ARM64_DIGEST: ${{ needs.push.outputs.arm64_digest }}
+        run: |
+          set -euo pipefail
+          python3 - "$AMD64_DIGEST" "$ARM64_DIGEST" <<'PY'
+          import json, pathlib, sys
+
+          amd64, arm64 = sys.argv[1], sys.argv[2]
+          expected = {
+              "pkg-linux-x64": (amd64, "linux/amd64"),
+              "pkg-linux-arm64": (arm64, "linux/arm64"),
+          }
+          for name, (digest, image_platform) in expected.items():
+              path = pathlib.Path("packages") / name / "release-result.json"
+              data = json.loads(path.read_text(encoding="utf-8"))
+              if data.get("image_platform") != image_platform:
+                  raise SystemExit(f"unexpected platform in {name}")
+              previous = data.get("digest")
+              data["digest"] = digest
+              path.write_text(json.dumps(data) + "\n", encoding="utf-8")
+              if previous == digest:
+                  print(f"aligned {name}: {digest} (unchanged)")
+              else:
+                  print(f"aligned {name}: {previous} -> {digest}")
+          PY
       - name: verify-tag
         env:
           SOURCE_GIT_TOKEN: ${{ secrets.SOURCE_GIT_TOKEN }}
