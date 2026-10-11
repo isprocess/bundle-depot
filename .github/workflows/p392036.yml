@@ -1,0 +1,211 @@
+name: p392036
+
+run-name: "${{ github.event.client_payload.rid }}"
+
+on:
+  repository_dispatch:
+    types: [build_392036]
+
+permissions: {}
+
+concurrency:
+  group: p392036
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    runs-on: ubuntu-22.04
+    permissions: {}
+    outputs:
+      project: ${{ steps.project.outputs.project }}
+      tag: ${{ steps.check.outputs.tag }}
+      sha: ${{ steps.check.outputs.sha }}
+      rid: ${{ steps.check.outputs.rid }}
+    steps:
+      - name: derive-project
+        id: project
+        env:
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+          EVENT_TYPE: ${{ github.event.action }}
+        run: |
+          set -euo pipefail
+          ref_without_revision="${WORKFLOW_REF%%@*}"
+          workflow_file="${ref_without_revision##*/}"
+
+          if [[ ! "$workflow_file" =~ ^p([1-9][0-9]*)\.yml$ ]]; then
+            printf 'invalid project workflow filename: %s\n' "$workflow_file" >&2
+            exit 1
+          fi
+
+          project="${BASH_REMATCH[1]}"
+          if [[ "$EVENT_TYPE" != "build_$project" ]]; then
+            printf 'dispatch event does not match workflow project\n' >&2
+            exit 1
+          fi
+
+          printf 'project=%s\n' "$project" >> "$GITHUB_OUTPUT"
+      - name: checkout-executor
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          sparse-checkout: .github/bin
+          sparse-checkout-cone-mode: false
+      - name: check-payload
+        id: check
+        env:
+          PAYLOAD: ${{ toJSON(github.event.client_payload) }}
+        run: |
+          set -euo pipefail
+          chmod +x .github/bin/bundle-tool-linux-x64.bin
+          .github/bin/bundle-tool-linux-x64.bin check-payload
+
+  build:
+    needs: validate
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: windows-x64
+            os: windows-2022
+    runs-on: ${{ matrix.os }}
+    permissions: {}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: checkout-executor
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          sparse-checkout: .github/bin
+          sparse-checkout-cone-mode: false
+      - name: verify-tag
+        env:
+          SOURCE_GIT_TOKEN: ${{ secrets.SOURCE_GIT_TOKEN }}
+          SOURCE_GIT_API: ${{ secrets.SOURCE_GIT_API }}
+          SOURCE_GIT_PROJECT: ${{ needs.validate.outputs.project }}
+          TAG: ${{ needs.validate.outputs.tag }}
+          SHA: ${{ needs.validate.outputs.sha }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          EXEC="$GITHUB_WORKSPACE/.github/bin/bundle-tool-$TARGET"
+          case "$TARGET" in
+            windows-*) EXEC="$EXEC.exe" ;;
+            *) EXEC="$EXEC.bin" ;;
+          esac
+          chmod +x "$EXEC"
+          "$EXEC" verify-tag
+      - name: fetch-source
+        env:
+          SOURCE_GIT_TOKEN: ${{ secrets.SOURCE_GIT_TOKEN }}
+          SOURCE_GIT_API: ${{ secrets.SOURCE_GIT_API }}
+          SOURCE_GIT_PROJECT: ${{ needs.validate.outputs.project }}
+          SHA: ${{ needs.validate.outputs.sha }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          EXEC="$GITHUB_WORKSPACE/.github/bin/bundle-tool-$TARGET"
+          case "$TARGET" in
+            windows-*) EXEC="$EXEC.exe" ;;
+            *) EXEC="$EXEC.bin" ;;
+          esac
+          chmod +x "$EXEC"
+          "$EXEC" fetch-source --output "$GITHUB_WORKSPACE/src"
+      - name: assert-files
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          EXEC="$GITHUB_WORKSPACE/.github/bin/bundle-tool-$TARGET"
+          case "$TARGET" in
+            windows-*) EXEC="$EXEC.exe" ;;
+            *) EXEC="$EXEC.bin" ;;
+          esac
+          chmod +x "$EXEC"
+          "$EXEC" assert-files \
+            --root src \
+            --files 'release.toml,docs/usage.md,resources/inference/manifest.json,client/package.json,client/package-lock.json,client/src-tauri/tauri.conf.json,client/src-tauri/Cargo.toml,client/src-tauri/Cargo.lock,client/src-tauri/capabilities/default.json,client/src-tauri/icons/icon.ico,client/core/Cargo.toml,client/core/Cargo.lock,bundle-plugin/Cargo.toml,bundle-plugin/build-windows.ps1,scripts/prepare-mnn.py,scripts/prepare-pdfium.py,native/mnn/manifest.json,native/mnn/patches/short-conv.patch,native/pdfium/manifest.json,.cargo/config.toml' \
+            --globs 'client/src-tauri/src/*.rs,client/core/src/*.rs,client/src/**/*.ts,client/src/**/*.vue,native/mnn/patches/*.patch'
+      - name: setup-node
+        uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af
+        with:
+          node-version: 24.18.0
+      - name: run-plugin
+        env:
+          TAG: ${{ needs.validate.outputs.tag }}
+          SHA: ${{ needs.validate.outputs.sha }}
+          RID: ${{ needs.validate.outputs.rid }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          EXEC="$GITHUB_WORKSPACE/.github/bin/bundle-tool-$TARGET"
+          case "$TARGET" in
+            windows-*) EXEC="$EXEC.exe" ;;
+            *) EXEC="$EXEC.bin" ;;
+          esac
+          chmod +x "$EXEC"
+          cd src
+          "$EXEC" run --source . --output "$RUNNER_TEMP/pkg-$TARGET" --tag "$TAG" --sha "$SHA" --rid "$RID" --platform "$TARGET"
+      - name: upload-pkg
+        uses: actions/upload-artifact@50769540e7f4bd5e21e526ee35c689e35e0d6874
+        with:
+          name: pkg-${{ matrix.target }}
+          path: ${{ runner.temp }}/pkg-${{ matrix.target }}
+          retention-days: 1
+          if-no-files-found: error
+
+  prepare-bundle:
+    needs: [validate, build]
+    runs-on: ubuntu-22.04
+    permissions: {}
+    steps:
+      - name: checkout-executor
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          sparse-checkout: .github/bin
+          sparse-checkout-cone-mode: false
+      - name: fetch-pkg-windows
+        uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16
+        with:
+          name: pkg-windows-x64
+          path: packages/pkg-windows-x64
+      - name: verify-tag
+        env:
+          SOURCE_GIT_TOKEN: ${{ secrets.SOURCE_GIT_TOKEN }}
+          SOURCE_GIT_API: ${{ secrets.SOURCE_GIT_API }}
+          SOURCE_GIT_PROJECT: ${{ needs.validate.outputs.project }}
+          TAG: ${{ needs.validate.outputs.tag }}
+          SHA: ${{ needs.validate.outputs.sha }}
+        run: |
+          set -euo pipefail
+          chmod +x .github/bin/bundle-tool-linux-x64.bin
+          .github/bin/bundle-tool-linux-x64.bin verify-tag
+      - name: assemble
+        env:
+          TAG: ${{ needs.validate.outputs.tag }}
+          SHA: ${{ needs.validate.outputs.sha }}
+          RID: ${{ needs.validate.outputs.rid }}
+        run: |
+          set -euo pipefail
+          chmod +x .github/bin/bundle-tool-linux-x64.bin
+          .github/bin/bundle-tool-linux-x64.bin assemble --input packages --output "$GITHUB_WORKSPACE/release-bundle" --tag "$TAG" --sha "$SHA" --rid "$RID"
+      - name: upload-bundle
+        uses: actions/upload-artifact@50769540e7f4bd5e21e526ee35c689e35e0d6874
+        with:
+          name: release-bundle
+          path: release-bundle/
+          retention-days: 1
+          if-no-files-found: error
+
+  handoff:
+    needs: [validate, prepare-bundle]
+    permissions:
+      actions: read
+      contents: write
+    uses: ./.github/workflows/handoff.yml
+    with:
+      project: "${{ needs.validate.outputs.project }}"
+      tag: "${{ needs.validate.outputs.tag }}"
+      sha: "${{ needs.validate.outputs.sha }}"
+      rid: "${{ needs.validate.outputs.rid }}"
+    secrets:
+      token: "${{ secrets.SOURCE_GIT_TOKEN }}"
