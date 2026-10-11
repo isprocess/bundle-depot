@@ -59,6 +59,7 @@ jobs:
             exit 1
           fi
           "$PYBIN" - <<'PY'
+          import json
           import os
           import sys
 
@@ -96,8 +97,22 @@ jobs:
           upload = os.path.join(bundle, "upload")
           if not os.path.isdir(upload):
               die("release-bundle upload directory missing")
+          try:
+              with open(os.path.join(bundle, "publish.json"), "rb") as handle:
+                  publish = json.load(handle)
+          except (ValueError, UnicodeError):
+              die("release-bundle publish.json is invalid")
+          if not isinstance(publish, dict):
+              die("release-bundle publish.json is invalid")
+          kind = publish.get("kind")
+          if kind == "files":
+              minimum, maximum = 2, 65
+          elif kind == "docker":
+              minimum, maximum = 1, 1
+          else:
+              die("release-bundle publish.json kind is invalid")
           names = [name for name in os.listdir(upload) if os.path.isfile(os.path.join(upload, name))]
-          if len(names) < 2 or len(names) > 65:
+          if len(names) < minimum or len(names) > maximum:
               die("release-bundle upload file count is invalid")
           PY
       - name: encrypt-handoff
