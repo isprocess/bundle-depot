@@ -1,44 +1,62 @@
 name: p396216
 
+run-name: "${{ github.event.client_payload.rid }}"
+
 on:
   repository_dispatch:
     types: [build_396216]
 
-permissions:
-  contents: write
-  id-token: write
-  packages: write
-  actions: read
+permissions: {}
 
 concurrency:
-  group: p396216-${{ github.event.client_payload.v }}
+  group: p396216
   cancel-in-progress: false
 
 jobs:
   validate:
     runs-on: ubuntu-22.04
+    permissions: {}
     outputs:
-      v: ${{ steps.out.outputs.v }}
-      ref: ${{ steps.out.outputs.ref }}
-      sha: ${{ steps.out.outputs.sha }}
-      rid: ${{ steps.out.outputs.rid }}
+      project: ${{ steps.project.outputs.project }}
+      tag: ${{ steps.check.outputs.tag }}
+      sha: ${{ steps.check.outputs.sha }}
+      rid: ${{ steps.check.outputs.rid }}
     steps:
-      - id: out
-        shell: bash
+      - name: derive-project
+        id: project
         env:
-          V: ${{ github.event.client_payload.v }}
-          REF: ${{ github.event.client_payload.ref }}
-          SHA: ${{ github.event.client_payload.sha }}
-          RID: ${{ github.event.client_payload.rid }}
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+          EVENT_TYPE: ${{ github.event.action }}
         run: |
           set -euo pipefail
-          [[ "$V" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || exit 1
-          [[ "$SHA" =~ ^[0-9a-f]{40}$ ]] || exit 1
-          [[ -n "$REF" ]] || exit 1
-          echo "v=$V" >> "$GITHUB_OUTPUT"
-          echo "ref=$REF" >> "$GITHUB_OUTPUT"
-          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
-          echo "rid=$RID" >> "$GITHUB_OUTPUT"
+          ref_without_revision="${WORKFLOW_REF%%@*}"
+          workflow_file="${ref_without_revision##*/}"
+
+          if [[ ! "$workflow_file" =~ ^p([1-9][0-9]*)\.yml$ ]]; then
+            printf 'invalid project workflow filename: %s\n' "$workflow_file" >&2
+            exit 1
+          fi
+
+          project="${BASH_REMATCH[1]}"
+          if [[ "$EVENT_TYPE" != "build_$project" ]]; then
+            printf 'dispatch event does not match workflow project\n' >&2
+            exit 1
+          fi
+
+          printf 'project=%s\n' "$project" >> "$GITHUB_OUTPUT"
+      - name: checkout-executor
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          sparse-checkout: .github/bin
+          sparse-checkout-cone-mode: false
+      - name: check-payload
+        id: check
+        env:
+          PAYLOAD: ${{ toJSON(github.event.client_payload) }}
+        run: |
+          set -euo pipefail
+          chmod +x .github/bin/bundle-tool-linux-x64.bin
+          .github/bin/bundle-tool-linux-x64.bin check-payload
 
   build:
     needs: validate
@@ -46,260 +64,364 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - arch: amd64
-            platform: linux/amd64
+          - target: linux-x64
             os: ubuntu-22.04
-          - arch: arm64
-            platform: linux/arm64
+          - target: linux-arm64
             os: ubuntu-24.04-arm
     runs-on: ${{ matrix.os }}
+    permissions: {}
     defaults:
       run:
         shell: bash
     steps:
-      - name: fetch
+      - name: checkout-executor
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          sparse-checkout: .github/bin
+          sparse-checkout-cone-mode: false
+      - name: verify-tag
         env:
           SOURCE_GIT_TOKEN: ${{ secrets.SOURCE_GIT_TOKEN }}
           SOURCE_GIT_API: ${{ secrets.SOURCE_GIT_API }}
-          SOURCE_GIT_PROJECT: ${{ secrets.SOURCE_GIT_PROJECT_396216 }}
+          SOURCE_GIT_PROJECT: ${{ needs.validate.outputs.project }}
+          TAG: ${{ needs.validate.outputs.tag }}
           SHA: ${{ needs.validate.outputs.sha }}
+          TARGET: ${{ matrix.target }}
         run: |
           set -euo pipefail
-          mkdir src
-          curl -fsSL -H "PRIVATE-TOKEN: ${SOURCE_GIT_TOKEN}" \
-            "${SOURCE_GIT_API}/projects/${SOURCE_GIT_PROJECT}/repository/archive?sha=${SHA}" \
-            -o src.zip
-          python3 - <<'PY'
-          import zipfile
-          from pathlib import Path
-          dest = Path("src")
-          zpath = Path("src.zip")
-          if zpath.stat().st_size < 1000:
-              raise SystemExit(1)
-          with zipfile.ZipFile(zpath) as z:
-              z.extractall(dest)
-          if not any(p.name == "Dockerfile" for p in dest.rglob("Dockerfile")):
-              raise SystemExit(1)
-          if not list(dest.rglob("go.mod")):
-              raise SystemExit(1)
-          if not list(dest.rglob("web/package.json")):
-              raise SystemExit(1)
-          PY
-          rm -f src.zip
-
-      - name: root
-        run: |
-          set -euo pipefail
-          ROOT="$(python3 - <<'PY'
-          from pathlib import Path
-          hits = []
-          for p in Path("src").rglob("Dockerfile"):
-              if p.name != "Dockerfile":
-                  continue
-              if (p.parent / "go.mod").is_file():
-                  hits.append(p.parent)
-          assert hits, "src root missing"
-          print(hits[0])
-          PY
-          )"
-          echo "SRC_ROOT=${ROOT}" >> "$GITHUB_ENV"
-
-      - name: version
+          EXEC="$GITHUB_WORKSPACE/.github/bin/bundle-tool-$TARGET.bin"
+          chmod +x "$EXEC"
+          "$EXEC" verify-tag
+      - name: fetch-source
         env:
-          VERSION: ${{ needs.validate.outputs.v }}
+          SOURCE_GIT_TOKEN: ${{ secrets.SOURCE_GIT_TOKEN }}
+          SOURCE_GIT_API: ${{ secrets.SOURCE_GIT_API }}
+          SOURCE_GIT_PROJECT: ${{ needs.validate.outputs.project }}
+          SHA: ${{ needs.validate.outputs.sha }}
+          TARGET: ${{ matrix.target }}
         run: |
           set -euo pipefail
-          echo "v${VERSION}" > "${SRC_ROOT}/VERSION"
-
-      - name: chmod
+          EXEC="$GITHUB_WORKSPACE/.github/bin/bundle-tool-$TARGET.bin"
+          chmod +x "$EXEC"
+          "$EXEC" fetch-source --output "$GITHUB_WORKSPACE/src"
+      - name: assert-files
+        env:
+          TARGET: ${{ matrix.target }}
         run: |
           set -euo pipefail
-          chmod +x "${SRC_ROOT}/scripts/"* || true
-
+          EXEC="$GITHUB_WORKSPACE/.github/bin/bundle-tool-$TARGET.bin"
+          chmod +x "$EXEC"
+          "$EXEC" assert-files --root src --files release.toml,release.py,docs/bundle-release.md,Dockerfile,VERSION
       - name: setup-buildx
         uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c
+      - name: run-plugin
+        env:
+          TAG: ${{ needs.validate.outputs.tag }}
+          SHA: ${{ needs.validate.outputs.sha }}
+          RID: ${{ needs.validate.outputs.rid }}
+          TARGET: ${{ matrix.target }}
+          BUNDLE_ALLOWED_CAPABILITIES: dockerhub-push
+          BUNDLE_DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          BUNDLE_DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          EXEC="$GITHUB_WORKSPACE/.github/bin/bundle-tool-$TARGET.bin"
+          chmod +x "$EXEC"
+          cd src
+          "$EXEC" run --source . --output "$RUNNER_TEMP/pkg-$TARGET" --tag "$TAG" --sha "$SHA" --rid "$RID" --platform "$TARGET"
+      - name: upload-pkg
+        uses: actions/upload-artifact@50769540e7f4bd5e21e526ee35c689e35e0d6874
+        with:
+          name: pkg-${{ matrix.target }}
+          path: ${{ runner.temp }}/pkg-${{ matrix.target }}
+          retention-days: 1
+          if-no-files-found: error
 
+  push:
+    needs: [validate, build]
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    defaults:
+      run:
+        shell: bash
+    outputs:
+      index_digest: ${{ steps.index.outputs.index_digest }}
+    steps:
+      - name: fetch-pkg-linux-x64
+        uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16
+        with:
+          name: pkg-linux-x64
+          path: packages/pkg-linux-x64
+      - name: fetch-pkg-linux-arm64
+        uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16
+        with:
+          name: pkg-linux-arm64
+          path: packages/pkg-linux-arm64
+      - name: read-digests
+        id: digests
+        run: |
+          set -euo pipefail
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import json, pathlib, re
+          pattern = re.compile(r"^sha256:[0-9a-f]{64}$")
+          expected = {"pkg-linux-x64": "linux/amd64", "pkg-linux-arm64": "linux/arm64"}
+          found = {}
+          for name, image_platform in expected.items():
+              path = pathlib.Path("packages") / name / "release-result.json"
+              data = json.loads(path.read_text(encoding="utf-8"))
+              if data.get("image_platform") != image_platform:
+                  raise SystemExit(f"unexpected platform in {name}")
+              digest = data.get("digest")
+              if not isinstance(digest, str) or not pattern.fullmatch(digest):
+                  raise SystemExit(f"invalid digest in {name}")
+              found[image_platform] = digest
+          print("amd64_digest=" + found["linux/amd64"])
+          print("arm64_digest=" + found["linux/arm64"])
+          PY
+      - name: setup-buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c
       - name: login
         uses: docker/login-action@c99871dec2022cc055c062a10cc1a1310835ceb4
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
-
-      - name: meta
+      - name: metadata
+        if: false
         id: meta
         uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302
         with:
           images: isprocess/new-api
-
-      - name: build
-        id: build
+      - name: build-push
+        if: false
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a
         with:
-          context: ${{ env.SRC_ROOT }}
-          file: ${{ env.SRC_ROOT }}/Dockerfile
-          platforms: ${{ matrix.platform }}
           push: true
-          tags: |
-            isprocess/new-api:v${{ needs.validate.outputs.v }}-${{ matrix.arch }}
-            isprocess/new-api:latest-${{ matrix.arch }}
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-          provenance: mode=max
-          sbom: true
+          outputs: type=image,push-by-digest=true,name-canonical=true,name=isprocess/new-api
 
-      - name: install-cosign
-        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6
-
-      - name: sign
-        run: cosign sign --yes isprocess/new-api@${{ steps.build.outputs.digest }}
-
-      - name: digest
+      - name: verify-platform-digests
         env:
-          VERSION: ${{ needs.validate.outputs.v }}
-          DIGEST: ${{ steps.build.outputs.digest }}
+          AMD64_DIGEST: ${{ steps.digests.outputs.amd64_digest }}
+          ARM64_DIGEST: ${{ steps.digests.outputs.arm64_digest }}
         run: |
           set -euo pipefail
-          mkdir -p dist
-          echo "${DIGEST}" > "dist/digest-${{ matrix.arch }}.txt"
-          echo "isprocess/new-api:v${VERSION}-${{ matrix.arch }}" > "dist/tag-${{ matrix.arch }}.txt"
+          python3 - <<'PY'
+          import json, os, subprocess
+          pairs = [
+              (os.environ["AMD64_DIGEST"], "amd64"),
+              (os.environ["ARM64_DIGEST"], "arm64"),
+          ]
+          for digest, arch in pairs:
+              out = subprocess.run(
+                  ["docker", "buildx", "imagetools", "inspect", f"isprocess/new-api@{digest}", "--format", "{{json .Image}}"],
+                  check=True, text=True, capture_output=True,
+              ).stdout
+              image = json.loads(out)
+              if image.get("os") != "linux" or image.get("architecture") != arch:
+                  raise SystemExit(f"remote platform mismatch for {digest}")
+              print(f"verified remote platform manifest {arch}: {digest}")
+          PY
+      - name: index
+        id: index
+        env:
+          TAG: ${{ needs.validate.outputs.tag }}
+          AMD64_DIGEST: ${{ steps.digests.outputs.amd64_digest }}
+          ARM64_DIGEST: ${{ steps.digests.outputs.arm64_digest }}
+        run: |
+          set -euo pipefail
+          image_tag="${TAG#v}"
+          ref="isprocess/new-api:${image_tag}"
 
-      - name: upload
-        uses: actions/upload-artifact@v4
-        with:
-          name: pkg-${{ matrix.arch }}
-          path: dist/
-          if-no-files-found: error
+          set +e
+          existing="$(docker buildx imagetools inspect "$ref" --format '{{json .Manifest.Digest}}' 2>/dev/null | tr -d '"')"
+          status=$?
+          set -e
+          if [ "$status" -ne 0 ] || [ -z "$existing" ]; then
+            printf 'version tag absent remotely, creating: %s\n' "$image_tag"
+            docker buildx imagetools create -t "$ref" "isprocess/new-api@${AMD64_DIGEST}" "isprocess/new-api@${ARM64_DIGEST}"
+          else
+            printf 'version tag present remotely: %s\n' "$image_tag"
+          fi
 
-  manifest:
-    needs: [validate, build]
+          raw="$(docker buildx imagetools inspect --raw "$ref")"
+          printf '%s' "$raw" | AMD64_DIGEST="$AMD64_DIGEST" ARM64_DIGEST="$ARM64_DIGEST" python3 - <<'PY'
+          import json, os, sys
+          index = json.load(sys.stdin)
+          expected = {
+              ("linux", "amd64"): os.environ["AMD64_DIGEST"],
+              ("linux", "arm64"): os.environ["ARM64_DIGEST"],
+          }
+          seen = {}
+          for entry in index.get("manifests", []):
+              platform = entry.get("platform") or {}
+              key = (platform.get("os"), platform.get("architecture"))
+              annotation = (entry.get("annotations") or {}).get("vnd.docker.reference.type")
+              if annotation == "attestation-manifest":
+                  continue
+              if key not in expected:
+                  raise SystemExit(f"unexpected index entry: {key}")
+              if entry.get("digest") != expected[key]:
+                  raise SystemExit(f"index digest mismatch for {key}")
+              seen[key] = entry.get("digest")
+          if set(seen) != set(expected):
+              raise SystemExit("index is missing a platform manifest")
+          print("index contains both verified platform digests")
+          PY
+
+          index_digest="$(docker buildx imagetools inspect "$ref" --format '{{json .Manifest.Digest}}' | tr -d '"')"
+          case "$index_digest" in
+            sha256:*) ;;
+            *) printf 'unexpected index digest: %s\n' "$index_digest" >&2; exit 1 ;;
+          esac
+          if [ "${#index_digest}" -ne 71 ]; then
+            printf 'unexpected index digest length: %s\n' "$index_digest" >&2
+            exit 1
+          fi
+          printf 'index_digest=%s\n' "$index_digest" >> "$GITHUB_OUTPUT"
+          printf 'index_digest=%s\n' "$index_digest"
+      - name: install-cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6
+      - name: sign
+        env:
+          AMD64_DIGEST: ${{ steps.digests.outputs.amd64_digest }}
+          ARM64_DIGEST: ${{ steps.digests.outputs.arm64_digest }}
+          INDEX_DIGEST: ${{ steps.index.outputs.index_digest }}
+        run: |
+          set -euo pipefail
+          cosign sign --yes "isprocess/new-api@${AMD64_DIGEST}"
+          cosign sign --yes "isprocess/new-api@${ARM64_DIGEST}"
+          cosign sign --yes "isprocess/new-api@${INDEX_DIGEST}"
+      - name: latest
+        env:
+          TAG: ${{ needs.validate.outputs.tag }}
+          AMD64_DIGEST: ${{ steps.digests.outputs.amd64_digest }}
+          ARM64_DIGEST: ${{ steps.digests.outputs.arm64_digest }}
+          INDEX_DIGEST: ${{ steps.index.outputs.index_digest }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os, re, subprocess, urllib.request
+
+          repo = "isprocess/new-api"
+          version = os.environ["TAG"][1:] if os.environ["TAG"].startswith("v") else os.environ["TAG"]
+          ours = tuple(int(part) for part in version.split("."))
+          amd64 = os.environ["AMD64_DIGEST"]
+          arm64 = os.environ["ARM64_DIGEST"]
+          index_digest = os.environ["INDEX_DIGEST"]
+
+          def inspect(ref):
+              done = subprocess.run(
+                  ["docker", "buildx", "imagetools", "inspect", ref, "--format", "{{json .Manifest.Digest}}"],
+                  text=True, capture_output=True,
+              )
+              if done.returncode != 0:
+                  return None
+              return json.loads(done.stdout)
+
+          current = inspect(f"{repo}:latest")
+          if current == index_digest:
+              print("latest already points at this index; nothing to update")
+              raise SystemExit(0)
+
+          if current is not None:
+              remote_version = None
+              digests = {}
+              url = f"https://hub.docker.com/v2/repositories/{repo}/tags?page_size=100"
+              with urllib.request.urlopen(url, timeout=30) as response:
+                  payload = json.load(response)
+              for tag in payload.get("results", []):
+                  name = tag.get("name") or ""
+                  digest = tag.get("digest")
+                  if re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", name):
+                      digests.setdefault(digest, []).append(tuple(int(p) for p in name.split(".")))
+              for digest, versions in digests.items():
+                  if digest == current:
+                      remote_version = max(versions)
+                      break
+              if remote_version is None:
+                  candidates = [v for versions in digests.values() for v in versions if v != ours]
+                  remote_version = max(candidates) if candidates else None
+              if remote_version is not None and ours <= remote_version:
+                  print(f"remote latest version {remote_version} not older than {ours}; leaving latest unchanged")
+                  raise SystemExit(0)
+              recheck = inspect(f"{repo}:latest")
+              if recheck != current:
+                  raise SystemExit("remote latest changed during verification; aborting")
+          else:
+              print("latest absent remotely; creating")
+
+          subprocess.run(
+              ["docker", "buildx", "imagetools", "create", "-t", f"{repo}:latest",
+               f"{repo}@{amd64}", f"{repo}@{arm64}"],
+              check=True,
+          )
+          print("latest updated")
+          PY
+
+  assemble:
+    needs: [validate, build, push]
     runs-on: ubuntu-22.04
+    permissions: {}
     defaults:
       run:
         shell: bash
     steps:
-      - name: login
-        uses: docker/login-action@c99871dec2022cc055c062a10cc1a1310835ceb4
+      - name: checkout-executor
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-
-      - name: create
-        env:
-          VERSION: ${{ needs.validate.outputs.v }}
-        run: |
-          set -euo pipefail
-          TAG="v${VERSION}"
-          docker buildx imagetools create \
-            -t "isprocess/new-api:${TAG}" \
-            "isprocess/new-api:${TAG}-amd64" \
-            "isprocess/new-api:${TAG}-arm64"
-          docker buildx imagetools create \
-            -t "isprocess/new-api:latest" \
-            "isprocess/new-api:latest-amd64" \
-            "isprocess/new-api:latest-arm64"
-
-      - name: install-cosign
-        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6
-
-      - name: sign
-        env:
-          VERSION: ${{ needs.validate.outputs.v }}
-        run: |
-          set -euo pipefail
-          TAG="v${VERSION}"
-          cosign sign --yes "isprocess/new-api:${TAG}"
-          cosign sign --yes "isprocess/new-api:latest"
-
-  release:
-    needs: [validate, build, manifest]
-    runs-on: ubuntu-22.04
-    steps:
-      - name: pull
-        uses: actions/download-artifact@v4
+          sparse-checkout: .github/bin
+          sparse-checkout-cone-mode: false
+      - name: fetch-pkg-linux-x64
+        uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16
         with:
-          path: artifacts
-          pattern: pkg-*
-
-      - name: sum
+          name: pkg-linux-x64
+          path: packages/pkg-linux-x64
+      - name: fetch-pkg-linux-arm64
+        uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16
+        with:
+          name: pkg-linux-arm64
+          path: packages/pkg-linux-arm64
+      - name: verify-tag
         env:
-          VERSION: ${{ needs.validate.outputs.v }}
-          SOURCE_REF: ${{ needs.validate.outputs.ref }}
-          SOURCE_SHA: ${{ needs.validate.outputs.sha }}
-          REQUEST_ID: ${{ needs.validate.outputs.rid }}
-          RUN_ID: ${{ github.run_id }}
+          SOURCE_GIT_TOKEN: ${{ secrets.SOURCE_GIT_TOKEN }}
+          SOURCE_GIT_API: ${{ secrets.SOURCE_GIT_API }}
+          SOURCE_GIT_PROJECT: ${{ needs.validate.outputs.project }}
+          TAG: ${{ needs.validate.outputs.tag }}
+          SHA: ${{ needs.validate.outputs.sha }}
         run: |
           set -euo pipefail
-          python3 - <<'PY'
-          import hashlib, json, os, pathlib, time
-          version = os.environ["VERSION"]
-          source_ref = os.environ["SOURCE_REF"]
-          source_sha = os.environ["SOURCE_SHA"]
-          request_id = os.environ["REQUEST_ID"]
-          run_id = os.environ["RUN_ID"]
-          root = pathlib.Path("artifacts")
-          amd = next(root.rglob("digest-amd64.txt")).read_text(encoding="utf-8").strip()
-          arm = next(root.rglob("digest-arm64.txt")).read_text(encoding="utf-8").strip()
-          if not amd or not arm:
-              raise SystemExit(1)
-
-          def sha256(p):
-              h = hashlib.sha256()
-              with p.open("rb") as f:
-                  for chunk in iter(lambda: f.read(1024 * 1024), b""):
-                      h.update(chunk)
-              return h.hexdigest()
-
-          outdir = pathlib.Path("dist")
-          outdir.mkdir(exist_ok=True)
-          man_name = f"new-api-v{version}-manifest.json"
-          sums_name = f"new-api-v{version}-checksums.txt"
-          manifest = {
-              "name": "new-api",
-              "version": version,
-              "image": "isprocess/new-api",
-              "contract_version": "release.v1",
-              "request_id": request_id,
-              "source_provider": "gongfeng",
-              "source_project_key": "new-api",
-              "source_ref": source_ref,
-              "source_commit_sha": source_sha,
-              "workflow_run_id": str(run_id),
-              "built_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-              "targets": ["linux/amd64", "linux/arm64"],
-              "tags": [
-                  f"v{version}",
-                  "latest",
-                  f"v{version}-amd64",
-                  f"v{version}-arm64",
-                  "latest-amd64",
-                  "latest-arm64",
-              ],
-              "digests": {"amd64": amd, "arm64": arm},
-          }
-          man_path = outdir / man_name
-          man_path.write_text(json.dumps(manifest, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-          man_sha = sha256(man_path)
-          (outdir / sums_name).write_text(f"{man_sha}  {man_name}\n", encoding="utf-8")
-          PY
-
-      - name: tag
+          chmod +x .github/bin/bundle-tool-linux-x64.bin
+          .github/bin/bundle-tool-linux-x64.bin verify-tag
+      - name: assemble
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          VERSION: ${{ needs.validate.outputs.v }}
-          SOURCE_SHA: ${{ needs.validate.outputs.sha }}
-          REQUEST_ID: ${{ needs.validate.outputs.rid }}
+          TAG: ${{ needs.validate.outputs.tag }}
+          SHA: ${{ needs.validate.outputs.sha }}
+          RID: ${{ needs.validate.outputs.rid }}
+          INDEX_DIGEST: ${{ needs.push.outputs.index_digest }}
         run: |
           set -euo pipefail
-          TAG="new-api-v${VERSION}"
-          if gh release view "$TAG" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
-            exit 1
-          fi
-          NOTES="sha: ${SOURCE_SHA}
-          rid: ${REQUEST_ID}"
-          gh release create "$TAG" \
-            --repo "${GITHUB_REPOSITORY}" \
-            --title "$TAG" \
-            --notes "$NOTES" \
-            "dist/new-api-v${VERSION}-manifest.json" \
-            "dist/new-api-v${VERSION}-checksums.txt"
+          chmod +x .github/bin/bundle-tool-linux-x64.bin
+          .github/bin/bundle-tool-linux-x64.bin assemble --input packages --output "$GITHUB_WORKSPACE/release-bundle" --tag "$TAG" --sha "$SHA" --rid "$RID" --index-digest "$INDEX_DIGEST"
+      - name: upload-bundle
+        uses: actions/upload-artifact@50769540e7f4bd5e21e526ee35c689e35e0d6874
+        with:
+          name: release-bundle
+          path: release-bundle/
+          retention-days: 1
+          if-no-files-found: error
+
+  handoff:
+    needs: [validate, assemble]
+    permissions:
+      actions: read
+      contents: write
+    uses: ./.github/workflows/handoff.yml
+    with:
+      project: "${{ needs.validate.outputs.project }}"
+      tag: "${{ needs.validate.outputs.tag }}"
+      sha: "${{ needs.validate.outputs.sha }}"
+      rid: "${{ needs.validate.outputs.rid }}"
+    secrets:
+      token: "${{ secrets.SOURCE_GIT_TOKEN }}"
