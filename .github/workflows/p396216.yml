@@ -245,8 +245,12 @@ jobs:
             printf 'version tag present remotely: %s\n' "$image_tag"
           fi
 
-          raw="$(docker buildx imagetools inspect --raw "$ref")"
-          printf '%s' "$raw" | AMD64_DIGEST="$AMD64_DIGEST" ARM64_DIGEST="$ARM64_DIGEST" python3 - <<'PY'
+          manifest_json="$(docker buildx imagetools inspect "$ref" --format '{{json .Manifest}}')"
+          if [ -z "$manifest_json" ]; then
+            printf 'empty index manifest for %s\n' "$ref" >&2
+            exit 1
+          fi
+          printf '%s' "$manifest_json" | AMD64_DIGEST="$AMD64_DIGEST" ARM64_DIGEST="$ARM64_DIGEST" python3 - <<'PY'
           import json, os, sys
           index = json.load(sys.stdin)
           expected = {
@@ -263,7 +267,11 @@ jobs:
               if key not in expected:
                   raise SystemExit(f"unexpected index entry: {key}")
               if entry.get("digest") != expected[key]:
-                  raise SystemExit(f"index digest mismatch for {key}")
+                  raise SystemExit(
+                      f"version tag exists with a different {key[0]}/{key[1]} digest; published version tags are "
+                      "never replaced - an unpublished leftover from a failed run must be deleted from the registry "
+                      "before a re-run"
+                  )
               seen[key] = entry.get("digest")
           if set(seen) != set(expected):
               raise SystemExit("index is missing a platform manifest")
