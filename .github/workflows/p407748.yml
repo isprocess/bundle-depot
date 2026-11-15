@@ -127,13 +127,21 @@ jobs:
             *) EXEC="$EXEC.bin" ;;
           esac
           chmod +x "$EXEC"
-          "$EXEC" assert-files --root src --files .node-version,package.json,package-lock.json,release.toml,index.html,tsconfig.json,vite.config.ts,electron/main.ts,electron/preload.ts,src/main.tsx,scripts/release/build.py,scripts/release/build.mjs,scripts/release/build-electron.mjs,scripts/release/electron-builder.yml,scripts/release/targets.json,scripts/release/after-pack.cjs,scripts/release/verify-artifact-signatures.mjs
+          "$EXEC" assert-files --root src --files .node-version,package.json,package-lock.json,release.toml,index.html,tsconfig.json,vite.config.ts,electron/main.ts,electron/preload.ts,src/main.tsx,scripts/release/build.py,scripts/release/build.mjs,scripts/release/build-channel.mjs,scripts/release/build-electron.mjs,scripts/release/electron-builder.yml,scripts/release/targets.json,scripts/release/after-pack.cjs,scripts/release/verify-artifact-signatures.mjs
       - name: run-plugin
         env:
           TAG: ${{ needs.validate.outputs.tag }}
           SHA: ${{ needs.validate.outputs.sha }}
           RID: ${{ needs.validate.outputs.rid }}
           TARGET: ${{ matrix.target }}
+          H3_DESKTOP_CI_TEST_BUILD: ${{ secrets.CSC_LINK == '' && '1' || '0' }}
+          CSC_LINK: ${{ secrets.CSC_LINK }}
+          CSC_KEY_PASSWORD: ${{ secrets.CSC_KEY_PASSWORD }}
+          H3_DESKTOP_WINDOWS_PUBLISHER_NAME: ${{ secrets.H3_DESKTOP_WINDOWS_PUBLISHER_NAME }}
+          CSC_NAME: ${{ secrets.CSC_NAME }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: |
           set -euo pipefail
           EXEC="$GITHUB_WORKSPACE/.github/bin/bundle-tool-$TARGET"
