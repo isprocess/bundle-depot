@@ -134,7 +134,6 @@ jobs:
           SHA: ${{ needs.validate.outputs.sha }}
           RID: ${{ needs.validate.outputs.rid }}
           TARGET: ${{ matrix.target }}
-          H3_DESKTOP_CI_TEST_BUILD: ${{ secrets.CSC_LINK == '' && '1' || '0' }}
           CSC_LINK: ${{ secrets.CSC_LINK }}
           CSC_KEY_PASSWORD: ${{ secrets.CSC_KEY_PASSWORD }}
           H3_DESKTOP_WINDOWS_PUBLISHER_NAME: ${{ secrets.H3_DESKTOP_WINDOWS_PUBLISHER_NAME }}
@@ -151,6 +150,16 @@ jobs:
           esac
           chmod +x "$EXEC"
           cd src
+          # bundle-tool 会清空插件环境；用源码根标记明确表达“未配置任何平台签名”的 test-only 构建。
+          if [[ "$TARGET" == windows-* ]]; then
+            if [[ -z "${CSC_LINK:-}" && -z "${CSC_KEY_PASSWORD:-}" && -z "${H3_DESKTOP_WINDOWS_PUBLISHER_NAME:-}" ]]; then
+              printf '1\n' > .ci-test-only
+            fi
+          else
+            if [[ -z "${CSC_NAME:-}" && -z "${APPLE_ID:-}" && -z "${APPLE_APP_SPECIFIC_PASSWORD:-}" && -z "${APPLE_TEAM_ID:-}" ]]; then
+              printf '1\n' > .ci-test-only
+            fi
+          fi
           "$EXEC" run --source . --output "$RUNNER_TEMP/pkg-$TARGET" --tag "$TAG" --sha "$SHA" --rid "$RID" --platform "$TARGET"
       - name: upload-pkg
         uses: actions/upload-artifact@50769540e7f4bd5e21e526ee35c689e35e0d6874
