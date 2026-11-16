@@ -90,10 +90,15 @@ jobs:
         run: |
           set -euo pipefail
           idempotency_key="github-schedule-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-          response="$(curl --silent --show-error --fail-with-body \
+          response_file="$RUNNER_TEMP/dispatch-tick.json"
+          status="$(curl --silent --show-error \
             --max-time 20 \
             --request POST \
             --header "Authorization: Bearer $TEXT_DISPATCH_TICK_TOKEN" \
             --header "Idempotency-Key: $idempotency_key" \
+            --output "$response_file" \
+            --write-out '%{http_code}' \
             "$GATEWAY_URL")"
-          printf '%s\n' "$response"
+          cat "$response_file"
+          printf '\n'
+          test "$status" = "200"
