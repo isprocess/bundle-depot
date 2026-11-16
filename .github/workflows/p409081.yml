@@ -1,0 +1,185 @@
+name: p409081
+
+run-name: "${{ github.event.client_payload.rid }}"
+
+on:
+  repository_dispatch:
+    types: [build_409081]
+
+permissions: {}
+
+concurrency:
+  group: p409081
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    runs-on: ubuntu-22.04
+    permissions: {}
+    outputs:
+      project: ${{ steps.project.outputs.project }}
+      tag: ${{ steps.check.outputs.tag }}
+      sha: ${{ steps.check.outputs.sha }}
+      rid: ${{ steps.check.outputs.rid }}
+    steps:
+      - name: derive-project
+        id: project
+        env:
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+          EVENT_TYPE: ${{ github.event.action }}
+        run: |
+          set -euo pipefail
+          ref_without_revision="${WORKFLOW_REF%%@*}"
+          workflow_file="${ref_without_revision##*/}"
+          if [[ ! "$workflow_file" =~ ^p([1-9][0-9]*)\.yml$ ]]; then
+            printf 'invalid project workflow filename\n' >&2
+            exit 1
+          fi
+          project="${BASH_REMATCH[1]}"
+          if [[ "$EVENT_TYPE" != "build_$project" ]]; then
+            printf 'dispatch event does not match workflow project\n' >&2
+            exit 1
+          fi
+          printf 'project=%s\n' "$project" >> "$GITHUB_OUTPUT"
+      - name: checkout-executor
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          sparse-checkout: .github/bin
+          sparse-checkout-cone-mode: false
+      - name: check-payload
+        id: check
+        env:
+          PAYLOAD: ${{ toJSON(github.event.client_payload) }}
+        run: |
+          set -euo pipefail
+          chmod +x .github/bin/bundle-tool-linux-x64.bin
+          .github/bin/bundle-tool-linux-x64.bin check-payload
+
+  build:
+    needs: validate
+    runs-on: ubuntu-22.04
+    permissions: {}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: checkout-executor
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          sparse-checkout: .github/bin
+          sparse-checkout-cone-mode: false
+      - name: verify-tag
+        env:
+          SOURCE_GIT_TOKEN: ${{ secrets.SOURCE_GIT_TOKEN }}
+          SOURCE_GIT_API: ${{ secrets.SOURCE_GIT_API }}
+          SOURCE_GIT_PROJECT: ${{ needs.validate.outputs.project }}
+          TAG: ${{ needs.validate.outputs.tag }}
+          SHA: ${{ needs.validate.outputs.sha }}
+          TARGET: linux-x64
+        run: |
+          set -euo pipefail
+          chmod +x .github/bin/bundle-tool-linux-x64.bin
+          .github/bin/bundle-tool-linux-x64.bin verify-tag
+      - name: fetch-source
+        env:
+          SOURCE_GIT_TOKEN: ${{ secrets.SOURCE_GIT_TOKEN }}
+          SOURCE_GIT_API: ${{ secrets.SOURCE_GIT_API }}
+          SOURCE_GIT_PROJECT: ${{ needs.validate.outputs.project }}
+          SHA: ${{ needs.validate.outputs.sha }}
+          TARGET: linux-x64
+        run: |
+          set -euo pipefail
+          chmod +x .github/bin/bundle-tool-linux-x64.bin
+          .github/bin/bundle-tool-linux-x64.bin fetch-source --output "$GITHUB_WORKSPACE/src"
+      - name: assert-files
+        run: |
+          set -euo pipefail
+          chmod +x .github/bin/bundle-tool-linux-x64.bin
+          .github/bin/bundle-tool-linux-x64.bin assert-files \
+            --root src \
+            --files Cargo.toml,Cargo.lock,release.toml,release.py,docs/usage.md,src/lib.rs,src/main.rs,src/runner_flow.rs,src/sse.rs,scripts/contract-check.mjs,tests/runner_flow.rs,tests/sse.rs
+      - name: run-plugin
+        env:
+          TAG: ${{ needs.validate.outputs.tag }}
+          SHA: ${{ needs.validate.outputs.sha }}
+          RID: ${{ needs.validate.outputs.rid }}
+        run: |
+          set -euo pipefail
+          chmod +x .github/bin/bundle-tool-linux-x64.bin
+          cd src
+          ../.github/bin/bundle-tool-linux-x64.bin run \
+            --source . \
+            --output "$RUNNER_TEMP/pkg-linux-x64" \
+            --tag "$TAG" \
+            --sha "$SHA" \
+            --rid "$RID" \
+            --platform linux-x64
+      - name: upload-pkg
+        uses: actions/upload-artifact@50769540e7f4bd5e21e526ee35c689e35e0d6874
+        with:
+          name: pkg-linux-x64
+          path: ${{ runner.temp }}/pkg-linux-x64
+          retention-days: 1
+          if-no-files-found: error
+
+  prepare-bundle:
+    needs: [validate, build]
+    runs-on: ubuntu-22.04
+    permissions: {}
+    steps:
+      - name: checkout-executor
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          sparse-checkout: .github/bin
+          sparse-checkout-cone-mode: false
+      - name: fetch-pkg-linux
+        uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16
+        with:
+          name: pkg-linux-x64
+          path: packages/pkg-linux-x64
+      - name: verify-tag
+        env:
+          SOURCE_GIT_TOKEN: ${{ secrets.SOURCE_GIT_TOKEN }}
+          SOURCE_GIT_API: ${{ secrets.SOURCE_GIT_API }}
+          SOURCE_GIT_PROJECT: ${{ needs.validate.outputs.project }}
+          TAG: ${{ needs.validate.outputs.tag }}
+          SHA: ${{ needs.validate.outputs.sha }}
+        run: |
+          set -euo pipefail
+          chmod +x .github/bin/bundle-tool-linux-x64.bin
+          .github/bin/bundle-tool-linux-x64.bin verify-tag
+      - name: assemble
+        env:
+          TAG: ${{ needs.validate.outputs.tag }}
+          SHA: ${{ needs.validate.outputs.sha }}
+          RID: ${{ needs.validate.outputs.rid }}
+        run: |
+          set -euo pipefail
+          chmod +x .github/bin/bundle-tool-linux-x64.bin
+          .github/bin/bundle-tool-linux-x64.bin assemble \
+            --input packages \
+            --output "$GITHUB_WORKSPACE/release-bundle" \
+            --tag "$TAG" \
+            --sha "$SHA" \
+            --rid "$RID"
+      - name: upload-bundle
+        uses: actions/upload-artifact@50769540e7f4bd5e21e526ee35c689e35e0d6874
+        with:
+          name: release-bundle
+          path: release-bundle/
+          retention-days: 1
+          if-no-files-found: error
+
+  handoff:
+    needs: [validate, prepare-bundle]
+    permissions:
+      actions: read
+      contents: write
+    uses: ./.github/workflows/handoff.yml
+    with:
+      project: "${{ needs.validate.outputs.project }}"
+      tag: "${{ needs.validate.outputs.tag }}"
+      sha: "${{ needs.validate.outputs.sha }}"
+      rid: "${{ needs.validate.outputs.rid }}"
+    secrets:
+      token: "${{ secrets.SOURCE_GIT_TOKEN }}"
