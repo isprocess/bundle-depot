@@ -7,6 +7,7 @@ on:
     types: [ai_studio_deepseek_job_v1]
   schedule:
     - cron: "*/5 * * * *"
+  workflow_dispatch:
 
 permissions: {}
 
@@ -77,7 +78,7 @@ jobs:
           .github/runner/deepseek-runner-linux-x64-musl.bin run
 
   tick:
-    if: github.event_name == 'schedule'
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-22.04
     timeout-minutes: 2
     permissions: {}
