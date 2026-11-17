@@ -1,10 +1,10 @@
 name: ai-studio-deepseek-runner
 
-run-name: "ai-studio-deepseek-${{ github.event.client_payload.job_id }}"
+run-name: "ai-studio-deepseek-${{ github.event.client_payload.batch_id || github.run_id }}"
 
 on:
   repository_dispatch:
-    types: [ai_studio_deepseek_job_v1]
+    types: [ai_studio_deepseek_batch_v1]
   schedule:
     - cron: "*/5 * * * *"
   workflow_dispatch:
@@ -12,14 +12,84 @@ on:
 permissions: {}
 
 concurrency:
-  group: ai-studio-deepseek-runner
+  group: ai-studio-text-${{ github.event.client_payload.batch_id || github.run_id }}
   cancel-in-progress: false
 
 jobs:
-  run:
+  validate:
     if: github.event_name == 'repository_dispatch'
     runs-on: ubuntu-22.04
+    timeout-minutes: 2
+    permissions: {}
+    outputs:
+      jobs: ${{ steps.parse.outputs.jobs }}
+    steps:
+      - name: validate-batch-payload
+        env:
+          PAYLOAD: ${{ toJSON(github.event.client_payload) }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import os
+          import re
+
+          payload = json.loads(os.environ["PAYLOAD"])
+          expected = {
+              "schema",
+              "batch_id",
+              "runner_release",
+              "expected_workflow_sha",
+              "jobs",
+          }
+          if not isinstance(payload, dict) or set(payload) != expected:
+              raise SystemExit("invalid payload shape")
+          if payload["schema"] != "ai_studio.deepseek_dispatch_batch.v1":
+              raise SystemExit("invalid payload schema")
+          for key in ("batch_id", "runner_release"):
+              value = payload[key]
+              if not isinstance(value, str) or not value or len(value) > 256:
+                  raise SystemExit("invalid payload value")
+              if any(ord(char) < 32 or ord(char) == 127 for char in value):
+                  raise SystemExit("invalid payload control")
+          sha = payload["expected_workflow_sha"]
+          if not isinstance(sha, str) or re.fullmatch(r"[a-f0-9]{40}", sha) is None:
+              raise SystemExit("invalid workflow sha")
+          jobs = payload["jobs"]
+          if not isinstance(jobs, list) or not 1 <= len(jobs) <= 20:
+              raise SystemExit("invalid jobs length")
+          seen_jobs = set()
+          seen_nonces = set()
+          normalized = []
+          for item in jobs:
+              if not isinstance(item, dict) or set(item) != {"job_id", "dispatch_nonce"}:
+                  raise SystemExit("invalid job shape")
+              job_id = item["job_id"]
+              nonce = item["dispatch_nonce"]
+              for value in (job_id, nonce):
+                  if not isinstance(value, str) or not value or len(value) > 256:
+                      raise SystemExit("invalid job value")
+                  if any(ord(char) < 32 or ord(char) == 127 for char in value):
+                      raise SystemExit("invalid job control")
+              if job_id in seen_jobs or nonce in seen_nonces:
+                  raise SystemExit("duplicate job identity")
+              seen_jobs.add(job_id)
+              seen_nonces.add(nonce)
+              normalized.append({"job_id": job_id, "dispatch_nonce": nonce})
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              output.write("jobs=" + json.dumps(normalized, separators=(",", ":")) + "\n")
+          PY
+
+  run:
+    if: github.event_name == 'repository_dispatch'
+    needs: validate
+    runs-on: ubuntu-22.04
     timeout-minutes: 5
+    strategy:
+      fail-fast: false
+      max-parallel: 20
+      matrix:
+        item: ${{ fromJSON(needs.validate.outputs.jobs) }}
     permissions:
       contents: read
       id-token: write
@@ -29,9 +99,10 @@ jobs:
         with:
           sparse-checkout: .github/runner
           sparse-checkout-cone-mode: false
-      - name: validate-payload
+      - name: validate-runner
         env:
-          PAYLOAD: ${{ toJSON(github.event.client_payload) }}
+          RUNNER_RELEASE: ${{ github.event.client_payload.runner_release }}
+          EXPECTED_WORKFLOW_SHA: ${{ github.event.client_payload.expected_workflow_sha }}
         run: |
           set -euo pipefail
           python3 - <<'PY'
@@ -39,19 +110,6 @@ jobs:
           import json
           import os
           from pathlib import Path
-
-          payload = json.loads(os.environ["PAYLOAD"])
-          expected = {"schema", "job_id", "runner_release", "dispatch_nonce"}
-          if not isinstance(payload, dict) or set(payload) != expected:
-              raise SystemExit("invalid payload shape")
-          if payload["schema"] != "ai_studio.deepseek_dispatch.v1":
-              raise SystemExit("invalid payload schema")
-          for key in ("job_id", "runner_release", "dispatch_nonce"):
-              value = payload[key]
-              if not isinstance(value, str) or not value or len(value) > 256:
-                  raise SystemExit("invalid payload value")
-              if any(ord(char) < 32 or ord(char) == 127 for char in value):
-                  raise SystemExit("invalid payload control")
 
           root = Path(".github/runner")
           manifest = json.loads((root / "deepseek-runner-manifest.json").read_text())
@@ -61,16 +119,18 @@ jobs:
               raise SystemExit("invalid runner manifest schema")
           if manifest["target"] != "x86_64-unknown-linux-musl":
               raise SystemExit("invalid runner target")
-          if payload["runner_release"] != manifest["runner_release"]:
+          if os.environ["RUNNER_RELEASE"] != manifest["runner_release"]:
               raise SystemExit("runner release mismatch")
           if digest != manifest["binary"]["sha256"]:
               raise SystemExit("runner digest mismatch")
+          if os.environ["EXPECTED_WORKFLOW_SHA"] != os.environ["GITHUB_SHA"]:
+              raise SystemExit("workflow sha mismatch")
           PY
       - name: execute-runner
         env:
           API_BASE_URL: "https://ai.yingkg.com/v1"
-          JOB_ID: ${{ github.event.client_payload.job_id }}
-          DISPATCH_NONCE: ${{ github.event.client_payload.dispatch_nonce }}
+          JOB_ID: ${{ matrix.item.job_id }}
+          DISPATCH_NONCE: ${{ matrix.item.dispatch_nonce }}
           DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
         run: |
           set -euo pipefail
