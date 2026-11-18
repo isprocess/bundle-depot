@@ -131,10 +131,11 @@ jobs:
           PY
       - name: execute-runner
         env:
-          API_BASE_URL: "https://ai.yingkg.com/v1"
+          API_BASE_URL: ${{ secrets.AI_STUDIO_RUNNER_API_BASE_URL }}
           JOB_ID: ${{ matrix.item.job_id }}
           DISPATCH_NONCE: ${{ matrix.item.dispatch_nonce }}
           DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          DEEPSEEK_BASE_URL: ${{ secrets.DEEPSEEK_BASE_URL }}
         run: |
           set -euo pipefail
           chmod +x .github/runner/deepseek-runner-linux-x64-musl.bin
@@ -190,7 +191,7 @@ jobs:
           PY
       - name: execute-probe
         env:
-          API_BASE_URL: "https://ai.yingkg.com/v1"
+          API_BASE_URL: ${{ secrets.AI_STUDIO_RUNNER_API_BASE_URL }}
           RUNNER_PROBE_ID: ${{ github.event.client_payload.probe_id }}
           RUNNER_PROBE_NONCE: ${{ github.event.client_payload.dispatch_nonce }}
         run: |
@@ -206,7 +207,7 @@ jobs:
     steps:
       - name: dispatch-tick
         env:
-          GATEWAY_URL: "https://ai.yingkg.com/v1/internal/text-dispatch-tick"
+          GATEWAY_URL: ${{ secrets.AI_STUDIO_TEXT_DISPATCH_TICK_URL }}
           TEXT_DISPATCH_TICK_TOKEN: ${{ secrets.TEXT_DISPATCH_TICK_TOKEN }}
         run: |
           set -euo pipefail
