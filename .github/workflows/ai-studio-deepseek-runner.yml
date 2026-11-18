@@ -82,7 +82,7 @@ jobs:
               output.write("jobs=" + json.dumps(normalized, separators=(",", ":")) + "\n")
           PY
 
-  run:
+  execute:
     if: github.event_name == 'repository_dispatch' && github.event.action == 'ai_studio_deepseek_batch_v1'
     needs: validate
     runs-on: ubuntu-22.04
