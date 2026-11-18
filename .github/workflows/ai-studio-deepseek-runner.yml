@@ -1,10 +1,12 @@
 name: ai-studio-deepseek-runner
 
-run-name: "ai-studio-deepseek-${{ github.event.client_payload.batch_id || github.run_id }}"
+run-name: "ai-studio-deepseek-${{ github.event.client_payload.batch_id || github.event.client_payload.probe_id || github.run_id }}"
 
 on:
   repository_dispatch:
-    types: [ai_studio_deepseek_batch_v1]
+    types:
+      - ai_studio_deepseek_batch_v1
+      - ai_studio.runner_health_probe.v1
   schedule:
     - cron: "*/5 * * * *"
   workflow_dispatch:
@@ -12,12 +14,12 @@ on:
 permissions: {}
 
 concurrency:
-  group: ai-studio-text-${{ github.event.client_payload.batch_id || github.run_id }}
+  group: ai-studio-text-${{ github.event.client_payload.batch_id || github.event.client_payload.probe_id || github.run_id }}
   cancel-in-progress: false
 
 jobs:
   validate:
-    if: github.event_name == 'repository_dispatch'
+    if: github.event_name == 'repository_dispatch' && github.event.action == 'ai_studio_deepseek_batch_v1'
     runs-on: ubuntu-22.04
     timeout-minutes: 2
     permissions: {}
@@ -81,7 +83,7 @@ jobs:
           PY
 
   run:
-    if: github.event_name == 'repository_dispatch'
+    if: github.event_name == 'repository_dispatch' && github.event.action == 'ai_studio_deepseek_batch_v1'
     needs: validate
     runs-on: ubuntu-22.04
     timeout-minutes: 5
@@ -136,6 +138,64 @@ jobs:
           set -euo pipefail
           chmod +x .github/runner/deepseek-runner-linux-x64-musl.bin
           .github/runner/deepseek-runner-linux-x64-musl.bin run
+
+  probe:
+    if: github.event_name == 'repository_dispatch' && github.event.action == 'ai_studio.runner_health_probe.v1'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 3
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: checkout-runner
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          sparse-checkout: .github/runner
+          sparse-checkout-cone-mode: false
+      - name: validate-probe-payload
+        env:
+          PAYLOAD: ${{ toJSON(github.event.client_payload) }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+
+          payload = json.loads(os.environ["PAYLOAD"])
+          expected = {"schema", "probe_id", "dispatch_nonce"}
+          if not isinstance(payload, dict) or set(payload) != expected:
+              raise SystemExit("invalid probe payload shape")
+          if payload["schema"] != "ai_studio.runner_health_probe.v1":
+              raise SystemExit("invalid probe payload schema")
+          for key in ("probe_id", "dispatch_nonce"):
+              value = payload[key]
+              if not isinstance(value, str) or not value or len(value) > 256:
+                  raise SystemExit("invalid probe payload value")
+              if any(ord(char) < 32 or ord(char) == 127 for char in value):
+                  raise SystemExit("invalid probe payload control")
+
+          root = Path(".github/runner")
+          manifest = json.loads((root / "deepseek-runner-manifest.json").read_text())
+          binary = root / manifest["binary"]["name"]
+          digest = hashlib.sha256(binary.read_bytes()).hexdigest()
+          if manifest["schema"] != "deepseek-runner.manifest.v1":
+              raise SystemExit("invalid runner manifest schema")
+          if manifest["target"] != "x86_64-unknown-linux-musl":
+              raise SystemExit("invalid runner target")
+          if digest != manifest["binary"]["sha256"]:
+              raise SystemExit("runner digest mismatch")
+          PY
+      - name: execute-probe
+        env:
+          API_BASE_URL: "https://ai.yingkg.com/v1"
+          RUNNER_PROBE_ID: ${{ github.event.client_payload.probe_id }}
+          RUNNER_PROBE_NONCE: ${{ github.event.client_payload.dispatch_nonce }}
+        run: |
+          set -euo pipefail
+          chmod +x .github/runner/deepseek-runner-linux-x64-musl.bin
+          .github/runner/deepseek-runner-linux-x64-musl.bin probe
 
   tick:
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
