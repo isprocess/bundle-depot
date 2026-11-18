@@ -27,6 +27,7 @@ jobs:
       jobs: ${{ steps.parse.outputs.jobs }}
     steps:
       - name: validate-batch-payload
+        id: parse
         env:
           PAYLOAD: ${{ toJSON(github.event.client_payload) }}
         run: |
