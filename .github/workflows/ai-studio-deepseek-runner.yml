@@ -32,58 +32,115 @@ jobs:
           PAYLOAD: ${{ toJSON(github.event.client_payload) }}
         run: |
           set -euo pipefail
-          python3 - <<'PY'
-          import json
-          import os
-          import re
+          node <<'NODE'
+          const fs = require("node:fs");
 
-          payload = json.loads(os.environ["PAYLOAD"])
-          expected = {
-              "schema",
-              "batch_id",
-              "runner_release",
-              "expected_workflow_sha",
-              "jobs",
+          // 失败只输出固定类别，避免 client payload 进入 Actions 日志。
+          function fail(category) {
+            process.stderr.write(`${category}\n`);
+            process.exit(1);
           }
-          if not isinstance(payload, dict) or set(payload) != expected:
-              raise SystemExit("invalid payload shape")
-          if payload["schema"] != "ai_studio.deepseek_dispatch_batch.v1":
-              raise SystemExit("invalid payload schema")
-          for key in ("batch_id", "runner_release"):
-              value = payload[key]
-              if not isinstance(value, str) or not value or len(value) > 256:
-                  raise SystemExit("invalid payload value")
-              if any(ord(char) < 32 or ord(char) == 127 for char in value):
-                  raise SystemExit("invalid payload control")
-          sha = payload["expected_workflow_sha"]
-          if not isinstance(sha, str) or re.fullmatch(r"[a-f0-9]{40}", sha) is None:
-              raise SystemExit("invalid workflow sha")
-          jobs = payload["jobs"]
-          if not isinstance(jobs, list) or not 1 <= len(jobs) <= 20:
-              raise SystemExit("invalid jobs length")
-          seen_jobs = set()
-          seen_nonces = set()
-          normalized = []
-          for item in jobs:
-              if not isinstance(item, dict) or set(item) != {"job_id", "dispatch_nonce"}:
-                  raise SystemExit("invalid job shape")
-              job_id = item["job_id"]
-              nonce = item["dispatch_nonce"]
-              for value in (job_id, nonce):
-                  if not isinstance(value, str) or not value or len(value) > 256:
-                      raise SystemExit("invalid job value")
-                  if any(ord(char) < 32 or ord(char) == 127 for char in value):
-                      raise SystemExit("invalid job control")
-              if job_id in seen_jobs or nonce in seen_nonces:
-                  raise SystemExit("duplicate job identity")
-              seen_jobs.add(job_id)
-              seen_nonces.add(nonce)
-              normalized.append({"job_id": job_id, "dispatch_nonce": nonce})
-          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
-              output.write("jobs=" + json.dumps(normalized, separators=(",", ":")) + "\n")
-          PY
+
+          function isOpaqueId(value) {
+            return (
+              typeof value === "string"
+              && value.length > 0
+              && value.length <= 256
+              && !/[\u0000-\u001f\u007f]/u.test(value)
+            );
+          }
+
+          let payload;
+          try {
+            payload = JSON.parse(process.env.PAYLOAD ?? "");
+          } catch {
+            fail("invalid payload json");
+          }
+          if (
+            payload === null
+            || typeof payload !== "object"
+            || Array.isArray(payload)
+          ) {
+            fail("invalid payload shape");
+          }
+
+          const expectedKeys = [
+            "batch_id",
+            "expected_workflow_sha",
+            "jobs",
+            "runner_release",
+            "schema",
+          ];
+          const actualKeys = Object.keys(payload).sort();
+          if (
+            actualKeys.length !== expectedKeys.length
+            || actualKeys.some((key, index) => key !== expectedKeys[index])
+          ) {
+            fail("invalid payload shape");
+          }
+          if (payload.schema !== "ai_studio.deepseek_dispatch_batch.v1") {
+            fail("invalid payload schema");
+          }
+          if (!isOpaqueId(payload.batch_id) || !isOpaqueId(payload.runner_release)) {
+            fail("invalid payload value");
+          }
+          if (
+            typeof payload.expected_workflow_sha !== "string"
+            || !/^[a-f0-9]{40}$/u.test(payload.expected_workflow_sha)
+          ) {
+            fail("invalid workflow sha");
+          }
+          if (
+            !Array.isArray(payload.jobs)
+            || payload.jobs.length < 1
+            || payload.jobs.length > 20
+          ) {
+            fail("invalid jobs length");
+          }
+
+          const seenJobIds = new Set();
+          const seenNonces = new Set();
+          const normalized = [];
+          for (const item of payload.jobs) {
+            if (
+              item === null
+              || typeof item !== "object"
+              || Array.isArray(item)
+            ) {
+              fail("invalid job shape");
+            }
+            const itemKeys = Object.keys(item).sort();
+            if (
+              itemKeys.length !== 2
+              || itemKeys[0] !== "dispatch_nonce"
+              || itemKeys[1] !== "job_id"
+            ) {
+              fail("invalid job shape");
+            }
+            if (!isOpaqueId(item.job_id) || !isOpaqueId(item.dispatch_nonce)) {
+              fail("invalid job value");
+            }
+            if (seenJobIds.has(item.job_id) || seenNonces.has(item.dispatch_nonce)) {
+              fail("duplicate job identity");
+            }
+            seenJobIds.add(item.job_id);
+            seenNonces.add(item.dispatch_nonce);
+            normalized.push({
+              leg_index: normalized.length + 1,
+              job_id: item.job_id,
+              dispatch_nonce: item.dispatch_nonce,
+            });
+          }
+
+          fs.appendFileSync(
+            process.env.GITHUB_OUTPUT,
+            `jobs=${JSON.stringify(normalized)}\n`,
+            "utf8",
+          );
+          NODE
 
   execute:
+    name: "ai-studio-deepseek-leg-${{ matrix.item.leg_index }}"
     if: github.event_name == 'repository_dispatch' && github.event.action == 'ai_studio_deepseek_batch_v1'
     needs: validate
     runs-on: ubuntu-22.04
@@ -103,32 +160,71 @@ jobs:
           sparse-checkout: .github/runner
           sparse-checkout-cone-mode: false
       - name: validate-runner
+        id: validate
         env:
           RUNNER_RELEASE: ${{ github.event.client_payload.runner_release }}
           EXPECTED_WORKFLOW_SHA: ${{ github.event.client_payload.expected_workflow_sha }}
         run: |
           set -euo pipefail
-          python3 - <<'PY'
-          import hashlib
-          import json
-          import os
-          from pathlib import Path
+          node <<'NODE'
+          const crypto = require("node:crypto");
+          const fs = require("node:fs");
+          const path = require("node:path");
 
-          root = Path(".github/runner")
-          manifest = json.loads((root / "deepseek-runner-manifest.json").read_text())
-          binary = root / manifest["binary"]["name"]
-          digest = hashlib.sha256(binary.read_bytes()).hexdigest()
-          if manifest["schema"] != "deepseek-runner.manifest.v1":
-              raise SystemExit("invalid runner manifest schema")
-          if manifest["target"] != "x86_64-unknown-linux-musl":
-              raise SystemExit("invalid runner target")
-          if os.environ["RUNNER_RELEASE"] != manifest["runner_release"]:
-              raise SystemExit("runner release mismatch")
-          if digest != manifest["binary"]["sha256"]:
-              raise SystemExit("runner digest mismatch")
-          if os.environ["EXPECTED_WORKFLOW_SHA"] != os.environ["GITHUB_SHA"]:
-              raise SystemExit("workflow sha mismatch")
-          PY
+          function fail(category) {
+            process.stderr.write(`${category}\n`);
+            process.exit(1);
+          }
+
+          const runnerRoot = path.resolve(".github/runner");
+          let manifest;
+          try {
+            manifest = JSON.parse(
+              fs.readFileSync(path.join(runnerRoot, "deepseek-runner-manifest.json"), "utf8"),
+            );
+          } catch {
+            fail("invalid runner manifest");
+          }
+          if (manifest.schema !== "deepseek-runner.manifest.v1") {
+            fail("invalid runner manifest schema");
+          }
+          if (manifest.target !== "x86_64-unknown-linux-musl") {
+            fail("invalid runner target");
+          }
+          if (process.env.RUNNER_RELEASE !== manifest.runner_release) {
+            fail("runner release mismatch");
+          }
+          const binaryName = manifest?.binary?.name;
+          if (
+            typeof binaryName !== "string"
+            || binaryName.length > 128
+            || !/^deepseek-runner-[A-Za-z0-9._-]+$/u.test(binaryName)
+            || path.basename(binaryName) !== binaryName
+          ) {
+            fail("invalid runner binary name");
+          }
+          const binaryPath = path.join(runnerRoot, binaryName);
+          let digest;
+          try {
+            digest = crypto
+              .createHash("sha256")
+              .update(fs.readFileSync(binaryPath))
+              .digest("hex");
+          } catch {
+            fail("runner binary unavailable");
+          }
+          if (digest !== manifest?.binary?.sha256) {
+            fail("runner digest mismatch");
+          }
+          if (process.env.EXPECTED_WORKFLOW_SHA !== process.env.GITHUB_SHA) {
+            fail("workflow sha mismatch");
+          }
+          fs.appendFileSync(
+            process.env.GITHUB_OUTPUT,
+            `binary=${binaryName}\n`,
+            "utf8",
+          );
+          NODE
       - name: execute-runner
         env:
           API_BASE_URL: ${{ secrets.AI_STUDIO_RUNNER_API_BASE_URL }}
@@ -136,10 +232,12 @@ jobs:
           DISPATCH_NONCE: ${{ matrix.item.dispatch_nonce }}
           DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
           DEEPSEEK_BASE_URL: ${{ secrets.DEEPSEEK_BASE_URL }}
+          RUNNER_BINARY: ${{ steps.validate.outputs.binary }}
         run: |
           set -euo pipefail
-          chmod +x .github/runner/deepseek-runner-linux-x64-musl.bin
-          .github/runner/deepseek-runner-linux-x64-musl.bin run
+          runner_path=".github/runner/${RUNNER_BINARY}"
+          chmod +x "$runner_path"
+          "$runner_path" run
 
   probe:
     if: github.event_name == 'repository_dispatch' && github.event.action == 'ai_studio.runner_health_probe.v1'
@@ -155,49 +253,110 @@ jobs:
           sparse-checkout: .github/runner
           sparse-checkout-cone-mode: false
       - name: validate-probe-payload
+        id: validate
         env:
           PAYLOAD: ${{ toJSON(github.event.client_payload) }}
         run: |
           set -euo pipefail
-          python3 - <<'PY'
-          import hashlib
-          import json
-          import os
-          from pathlib import Path
+          node <<'NODE'
+          const fs = require("node:fs");
+          const path = require("node:path");
 
-          payload = json.loads(os.environ["PAYLOAD"])
-          expected = {"schema", "probe_id", "dispatch_nonce"}
-          if not isinstance(payload, dict) or set(payload) != expected:
-              raise SystemExit("invalid probe payload shape")
-          if payload["schema"] != "ai_studio.runner_health_probe.v1":
-              raise SystemExit("invalid probe payload schema")
-          for key in ("probe_id", "dispatch_nonce"):
-              value = payload[key]
-              if not isinstance(value, str) or not value or len(value) > 256:
-                  raise SystemExit("invalid probe payload value")
-              if any(ord(char) < 32 or ord(char) == 127 for char in value):
-                  raise SystemExit("invalid probe payload control")
+          function fail(category) {
+            process.stderr.write(`${category}\n`);
+            process.exit(1);
+          }
 
-          root = Path(".github/runner")
-          manifest = json.loads((root / "deepseek-runner-manifest.json").read_text())
-          binary = root / manifest["binary"]["name"]
-          digest = hashlib.sha256(binary.read_bytes()).hexdigest()
-          if manifest["schema"] != "deepseek-runner.manifest.v1":
-              raise SystemExit("invalid runner manifest schema")
-          if manifest["target"] != "x86_64-unknown-linux-musl":
-              raise SystemExit("invalid runner target")
-          if digest != manifest["binary"]["sha256"]:
-              raise SystemExit("runner digest mismatch")
-          PY
+          function isOpaqueId(value) {
+            return (
+              typeof value === "string"
+              && value.length > 0
+              && value.length <= 256
+              && !/[\u0000-\u001f\u007f]/u.test(value)
+            );
+          }
+
+          let payload;
+          try {
+            payload = JSON.parse(process.env.PAYLOAD ?? "");
+          } catch {
+            fail("invalid probe payload json");
+          }
+          if (
+            payload === null
+            || typeof payload !== "object"
+            || Array.isArray(payload)
+          ) {
+            fail("invalid probe payload shape");
+          }
+          const expectedKeys = ["dispatch_nonce", "probe_id", "schema"];
+          const actualKeys = Object.keys(payload).sort();
+          if (
+            actualKeys.length !== expectedKeys.length
+            || actualKeys.some((key, index) => key !== expectedKeys[index])
+          ) {
+            fail("invalid probe payload shape");
+          }
+          if (payload.schema !== "ai_studio.runner_health_probe.v1") {
+            fail("invalid probe payload schema");
+          }
+          if (!isOpaqueId(payload.probe_id) || !isOpaqueId(payload.dispatch_nonce)) {
+            fail("invalid probe payload value");
+          }
+
+          const runnerRoot = path.resolve(".github/runner");
+          let manifest;
+          try {
+            manifest = JSON.parse(
+              fs.readFileSync(path.join(runnerRoot, "deepseek-runner-manifest.json"), "utf8"),
+            );
+          } catch {
+            fail("invalid runner manifest");
+          }
+          if (manifest.schema !== "deepseek-runner.manifest.v1") {
+            fail("invalid runner manifest schema");
+          }
+          if (manifest.target !== "x86_64-unknown-linux-musl") {
+            fail("invalid runner target");
+          }
+          const binaryName = manifest?.binary?.name;
+          if (
+            typeof binaryName !== "string"
+            || binaryName.length > 128
+            || !/^deepseek-runner-[A-Za-z0-9._-]+$/u.test(binaryName)
+            || path.basename(binaryName) !== binaryName
+          ) {
+            fail("invalid runner binary name");
+          }
+          let digest;
+          try {
+            digest = require("node:crypto")
+              .createHash("sha256")
+              .update(fs.readFileSync(path.join(runnerRoot, binaryName)))
+              .digest("hex");
+          } catch {
+            fail("runner binary unavailable");
+          }
+          if (digest !== manifest?.binary?.sha256) {
+            fail("runner digest mismatch");
+          }
+          fs.appendFileSync(
+            process.env.GITHUB_OUTPUT,
+            `binary=${binaryName}\n`,
+            "utf8",
+          );
+          NODE
       - name: execute-probe
         env:
           API_BASE_URL: ${{ secrets.AI_STUDIO_RUNNER_API_BASE_URL }}
           RUNNER_PROBE_ID: ${{ github.event.client_payload.probe_id }}
           RUNNER_PROBE_NONCE: ${{ github.event.client_payload.dispatch_nonce }}
+          RUNNER_BINARY: ${{ steps.validate.outputs.binary }}
         run: |
           set -euo pipefail
-          chmod +x .github/runner/deepseek-runner-linux-x64-musl.bin
-          .github/runner/deepseek-runner-linux-x64-musl.bin probe
+          runner_path=".github/runner/${RUNNER_BINARY}"
+          chmod +x "$runner_path"
+          "$runner_path" probe
 
   tick:
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
