@@ -1,17 +1,17 @@
 {
   "schema": "deepseek-runner.manifest.v1",
-  "runner_version": "0.1.34",
-  "runner_release": "deepseek-runner-v0.1.34-83bceda86500",
-  "source_commit_sha": "83bceda86500be2ae3a989b03fd58951992d67fc",
-  "source_tag": "v0.1.34",
-  "request_id": "b-0.1.34-83bceda86500-20261121T122025Z",
+  "runner_version": "0.1.36",
+  "runner_release": "deepseek-runner-v0.1.36-fc11f63c8e1e",
+  "source_commit_sha": "fc11f63c8e1ebcd69a11cc577e87f0120dbc3155",
+  "source_tag": "v0.1.36",
+  "request_id": "b-0.1.36-fc11f63c8e1e-20261121T132709Z",
   "target": "x86_64-unknown-linux-musl",
   "platform": "linux-x64",
   "binary": {
     "name": "deepseek-runner-linux-x64-musl.bin",
-    "bytes": 3130288,
-    "sha256": "ad5aeec3bc4b80ee2354f975893ef79a0544993dbda0b0a89963b1fbfe99fb93",
-    "format": "ELF 64-bit LSB pie executable, x86-64, version 1 (SYSV), static-pie linked, BuildID[sha1]=291e3999326356f6ffb256c70a1bacf48f25e217, stripped",
+    "bytes": 3134384,
+    "sha256": "ed75ef219928dc1d4515d9e64fd04bf632f05501500bc72741784f6bc2d03468",
+    "format": "ELF 64-bit LSB pie executable, x86-64, version 1 (SYSV), static-pie linked, BuildID[sha1]=dea483c9aa5d70127de3f3fecf3e916d8909cad8, stripped",
     "static": true
   },
   "compiler": "rustc 1.99.1 (58cf8f9c3 2026-10-13)",
@@ -21,5 +21,5 @@
     "ai_studio.deepseek_claim.v1"
   ],
   "result_schema": "ai_studio.deepseek_result_callback.v1",
-  "generated_at": "2026-11-21T12:22:42.632751Z"
+  "generated_at": "2026-11-21T13:29:43.806805Z"
 }
