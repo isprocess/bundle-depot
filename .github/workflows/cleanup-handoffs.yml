@@ -362,7 +362,7 @@ jobs:
             exit 1
           fi
           "$PYBIN" - <<'PY'
-          """Bounded Actions run cleanup; never deletes running or current runs."""
+          """Two-hour Actions run cleanup; never deletes running or current runs."""
 
           import hashlib
           import json
@@ -376,22 +376,9 @@ jobs:
           from datetime import datetime, timedelta, timezone
 
           API_ROOT = "https://api.github.com"
-          RETENTION = timedelta(days=14)
-          KEEP_SUCCESS = 20
-          KEEP_FAILURE = 10
-          MAX_DELETE = 300
+          RETENTION = timedelta(hours=2)
+          MAX_DELETE = 900
           PAGE_CAP = 100
-          FAILURE_CONCLUSIONS = {"failure", "timed_out", "startup_failure"}
-          PROTECTED_WORKFLOWS = {
-              "p407748.yml",
-              "p409081.yml",
-              "ai-studio-deepseek-runner.yml",
-              "cleanup-handoffs.yml",
-          }
-          # 自清理工作流每次 plan 都会新增 run，若把自身 run 放进候选或样例，
-          # dry-run 完成本身就会改变下一次候选摘要。这里永久保留其运行历史，
-          # 由独立的人工证据流程处理，不能用同一 plan/apply 摘要门删除自己。
-          SELF_WORKFLOWS = {"cleanup-handoffs.yml"}
 
 
           def die(message):
@@ -504,23 +491,6 @@ jobs:
               return parse_time(run.get("run_started_at")) or parse_time(run.get("created_at"))
 
 
-          def workflow_basename(path):
-              return path.rsplit("/", 1)[-1]
-
-
-          def is_protected(path):
-              return workflow_basename(path) in PROTECTED_WORKFLOWS
-
-
-          def conclusion_group(run):
-              conclusion = run.get("conclusion")
-              if conclusion == "success":
-                  return "success"
-              if conclusion in FAILURE_CONCLUSIONS:
-                  return "failure"
-              return "other"
-
-
           def candidate_digest(candidates):
               digest = hashlib.sha256()
               for candidate in candidates:
@@ -529,9 +499,7 @@ jobs:
                       "workflow_id": candidate["workflow_id"],
                       "workflow": candidate["workflow"],
                       "conclusion": candidate["conclusion"],
-                      "run_attempt": candidate["run_attempt"],
-                      "anchor_raw": candidate["anchor_raw"],
-                      "protected": candidate["protected"],
+                      "anchor": candidate["anchor"].isoformat(),
                   }
                   digest.update(
                       (json.dumps(state, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
@@ -548,102 +516,57 @@ jobs:
                   "workflow_runs",
                   "run list",
               )
-              groups = {}
+              candidates = []
+              skipped = Counter()
+              workflow_ids = set()
+              current_id = os.environ.get("CURRENT_RUN_ID", "")
+              scanned = len(runs)
               for run in runs:
                   if not isinstance(run, dict):
                       die("run list contained a non-object")
+                  run_id = run.get("id")
+                  if isinstance(run_id, bool) or not isinstance(run_id, int):
+                      die("run id was invalid")
                   workflow_id = run.get("workflow_id")
                   if isinstance(workflow_id, bool) or not isinstance(workflow_id, int):
                       die("run workflow id was invalid")
+                  workflow_ids.add(workflow_id)
                   path = run.get("path")
                   if not isinstance(path, str) or not path.startswith(".github/workflows/"):
                       path = "workflow:%d" % workflow_id
-                  groups.setdefault((workflow_id, path), []).append(run)
-
-              candidates = []
-              skipped = Counter()
-              retained_samples = 0
-              current_id = os.environ.get("CURRENT_RUN_ID", "")
-              scanned = len(runs)
-              for (workflow_id, path), workflow_runs in groups.items():
-                  if workflow_basename(path) in SELF_WORKFLOWS:
-                      skipped["cleanup_workflow_self"] += len(workflow_runs)
+                  if str(run_id) == current_id:
+                      skipped["current"] += 1
                       continue
-                  scheduled = []
-                  for run in workflow_runs:
-                      run_id = run.get("id")
-                      if isinstance(run_id, bool) or not isinstance(run_id, int):
-                          die("run id was invalid")
-                      if str(run_id) == current_id:
-                          skipped["current"] += 1
-                          continue
-                      if run.get("status") != "completed":
-                          skipped["not_completed"] += 1
-                          continue
-                      anchor = run_time(run)
-                      if anchor is None:
-                          skipped["missing_time"] += 1
-                          continue
-                      run_attempt = run.get("run_attempt")
-                      if (
-                          isinstance(run_attempt, bool)
-                          or not isinstance(run_attempt, int)
-                          or run_attempt < 1
-                      ):
-                          die("run attempt was invalid")
-                      scheduled.append((anchor, run))
-
-                  scheduled.sort(key=lambda item: item[0], reverse=True)
-                  success_kept = 0
-                  failure_kept = 0
-                  keep_ids = set()
-                  latest_success = None
-                  latest_failure = None
-                  for _anchor, run in scheduled:
-                      group = conclusion_group(run)
-                      if group == "success":
-                          if latest_success is None:
-                              latest_success = run["id"]
-                          if success_kept < KEEP_SUCCESS:
-                              keep_ids.add(run["id"])
-                              success_kept += 1
-                      elif group == "failure":
-                          if latest_failure is None:
-                              latest_failure = run["id"]
-                          if failure_kept < KEEP_FAILURE:
-                              keep_ids.add(run["id"])
-                              failure_kept += 1
-                  if is_protected(path):
-                      # 保护 workflow 无论年龄都必须保留最近一次成功与最近一次失败。
-                      if latest_success is not None:
-                          keep_ids.add(latest_success)
-                      if latest_failure is not None:
-                          keep_ids.add(latest_failure)
-                  retained_samples += len(keep_ids)
-
-                  for anchor, run in scheduled:
-                      if run["id"] in keep_ids:
-                          skipped["sample_retention"] += 1
-                          continue
-                      if now - anchor < RETENTION:
-                          skipped["within_retention"] += 1
-                          continue
-                      candidates.append({
-                          "id": run["id"],
-                          "workflow_id": workflow_id,
-                          "workflow": path,
-                          "conclusion": run.get("conclusion"),
-                          "run_attempt": run.get("run_attempt"),
-                          "anchor": anchor,
-                          "anchor_raw": run.get("run_started_at") or run.get("created_at"),
-                          "protected": is_protected(path),
-                      })
+                  if run.get("status") != "completed":
+                      skipped["not_completed"] += 1
+                      continue
+                  anchor = run_time(run)
+                  if anchor is None:
+                      skipped["missing_time"] += 1
+                      continue
+                  run_attempt = run.get("run_attempt")
+                  if (
+                      isinstance(run_attempt, bool)
+                      or not isinstance(run_attempt, int)
+                      or run_attempt < 1
+                  ):
+                      die("run attempt was invalid")
+                  if now - anchor < RETENTION:
+                      skipped["within_retention"] += 1
+                      continue
+                  candidates.append({
+                      "id": run_id,
+                      "workflow_id": workflow_id,
+                      "workflow": path,
+                      "conclusion": run.get("conclusion"),
+                      "anchor": anchor,
+                  })
               candidates.sort(key=lambda item: (item["anchor"], item["id"]))
               return {
-                  "workflows": len(groups),
+                  "workflows": len(workflow_ids),
                   "workflow_total": run_total,
                   "scanned": scanned,
-                  "retained_samples": retained_samples,
+                  "retained_samples": 0,
                   "candidates": candidates,
                   "skipped": skipped,
               }
@@ -659,53 +582,13 @@ jobs:
                   run_id = candidate["id"]
                   if not apply:
                       sys.stdout.write(
-                          "planned_run_removal id=%s workflow=%s conclusion=%s protected=%s age_days=%s\n"
+                          "planned_run_removal id=%s workflow=%s conclusion=%s age_minutes=%d\n"
                           % (
                               run_id,
                               candidate["workflow"],
                               candidate["conclusion"],
-                              str(candidate["protected"]).lower(),
-                              (datetime.now(timezone.utc) - candidate["anchor"]).days,
+                              int((datetime.now(timezone.utc) - candidate["anchor"]).total_seconds() / 60),
                           )
-                      )
-                      processed += 1
-                      continue
-                  status, headers, payload = client.request(
-                      "GET",
-                      API_ROOT + "/repos/%s/actions/runs/%d" % (repo, run_id),
-                      token,
-                  )
-                  if status == 404:
-                      absent += 1
-                      processed += 1
-                      continue
-                  if status in (403, 429):
-                      stopped = status
-                      time.sleep(retry_after(headers))
-                      break
-                  if status != 200:
-                      sys.stdout.write(
-                          "run_removal_skipped id=%s workflow=%s conclusion=%s status=%s\n"
-                          % (run_id, candidate["workflow"], candidate["conclusion"], status)
-                      )
-                      processed += 1
-                      continue
-                  current = json_value(payload, "run recheck")
-                  if not isinstance(current, dict):
-                      die("run recheck response was not an object")
-                  current_anchor = current.get("run_started_at") or current.get("created_at")
-                  if (
-                      str(current.get("id")) != str(run_id)
-                      or current.get("status") != "completed"
-                      or current.get("workflow_id") != candidate["workflow_id"]
-                      or current.get("run_attempt") != candidate["run_attempt"]
-                      or current.get("conclusion") != candidate["conclusion"]
-                      or current_anchor != candidate["anchor_raw"]
-                      or str(current.get("id")) == os.environ.get("CURRENT_RUN_ID", "")
-                  ):
-                      sys.stdout.write(
-                          "run_removal_skipped id=%s workflow=%s conclusion=%s reason=state_changed\n"
-                          % (run_id, candidate["workflow"], candidate["conclusion"])
                       )
                       processed += 1
                       continue
@@ -745,20 +628,22 @@ jobs:
               token = os.environ["GITHUB_TOKEN"]
               repo = os.environ["GITHUB_REPOSITORY"]
               event = os.environ.get("EVENT_NAME", "")
-              # 定时任务只生成证据和摘要，绝不自动删除；人工确认摘要后才允许 apply。
-              apply = event != "schedule" and os.environ.get("APPLY_INPUT", "").lower() == "true"
+              # 定时任务直接按 2 小时保留执行；人工 apply 仍需确认摘要。
+              scheduled = event == "schedule"
+              apply = scheduled or os.environ.get("APPLY_INPUT", "").lower() == "true"
               now = datetime.now(timezone.utc)
               client = HttpClient()
               result = collect_candidates(client, repo, token, now)
               digest = candidate_digest(result["candidates"])
-              expected = os.environ.get("CONFIRM_DIGEST", "").strip().lower()
-              if apply and (
-                  len(expected) != 64
-                  or any(ch not in "0123456789abcdef" for ch in expected)
-              ):
-                  die("apply requires confirm_digest from the immediately preceding dry-run")
-              if apply and digest != expected:
-                  die("candidate set changed since the reviewed dry-run; not deleting")
+              if apply and not scheduled:
+                  expected = os.environ.get("CONFIRM_DIGEST", "").strip().lower()
+                  if (
+                      len(expected) != 64
+                      or any(ch not in "0123456789abcdef" for ch in expected)
+                  ):
+                      die("apply requires confirm_digest from the immediately preceding dry-run")
+                  if digest != expected:
+                      die("candidate set changed since the reviewed dry-run; not deleting")
               sys.stdout.write("candidate_digest sha256=%s\n" % digest)
               outcome = delete_candidates(
                   client,
